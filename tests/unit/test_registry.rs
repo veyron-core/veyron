@@ -1171,3 +1171,107 @@ fn re_register_refreshes_device_metadata() {
     assert_eq!(dev.capabilities, vec!["clipboard".to_string()]);
     assert_eq!(reg.list_devices().len(), 1, "still one device record");
 }
+
+#[test]
+fn register_single_device_with_multiple_caps_creates_one_entry() {
+    let reg = PluginRegistry::new();
+    let caps = vec![
+        "battery".to_string(),
+        "geo".to_string(),
+        "clipboard".to_string(),
+        "contacts".to_string(),
+        "mic".to_string(),
+        "speaker".to_string(),
+        "chat".to_string(),
+        "device".to_string(),
+    ];
+    reg.register_device(
+        "dev-xxx".to_string(),
+        99,
+        caps.clone(),
+        dummy_manifest(),
+        dummy_write_tx(),
+        DeviceMeta {
+            device_id: "dev-xxx".to_string(),
+            user_id: "default".to_string(),
+            os: DeviceOs::Android,
+            arch: "aarch64".to_string(),
+            os_version: "14".to_string(),
+            capabilities: caps.clone(),
+        },
+    )
+    .expect("mux register must succeed");
+
+    assert_eq!(reg.list().len(), 1, "one registry entry for mux device");
+    let entry = reg.get("dev-xxx").expect("device entry must exist");
+    assert_eq!(entry.plugin_id, "dev-xxx");
+    assert_eq!(entry.conn_id, 99);
+    let expected_actions: Vec<String> = caps.iter().map(|c| format!("dev-xxx.{c}")).collect();
+    assert_eq!(entry.manifest.actions, expected_actions);
+    let dev = reg.get_device("dev-xxx").expect("device info must exist");
+    assert_eq!(dev.capabilities, caps);
+    assert_eq!(reg.get_by_conn_id(99).unwrap().plugin_id, "dev-xxx");
+    assert!(reg.get_mux("dev-xxx.geo").is_some());
+    assert_eq!(reg.get_mux("dev-xxx.geo").unwrap().plugin_id, "dev-xxx");
+    assert!(reg.get_mux("dev-xxx.battery").is_some());
+}
+
+#[test]
+fn deprecated_per_cap_still_works() {
+    let reg = PluginRegistry::new();
+    for (i, cap) in ["geo", "battery", "clipboard"].iter().enumerate() {
+        let plugin_id = format!("dev-xxx.{cap}");
+        reg.register_with_device(
+            plugin_id.clone(),
+            i as u64 + 1,
+            dummy_manifest(),
+            dummy_write_tx(),
+            DeviceMeta {
+                device_id: "dev-xxx".to_string(),
+                user_id: "default".to_string(),
+                os: DeviceOs::Android,
+                arch: "aarch64".to_string(),
+                os_version: "14".to_string(),
+                capabilities: vec![cap.to_string()],
+            },
+        )
+        .expect("per-cap register must succeed");
+    }
+    assert_eq!(reg.list().len(), 3);
+    assert!(reg.get("dev-xxx.geo").is_some());
+    assert!(reg.get("dev-xxx.battery").is_some());
+    assert!(reg.get("dev-xxx.clipboard").is_some());
+    let dev = reg.get_device("dev-xxx").expect("device must exist");
+    assert_eq!(dev.capabilities, vec!["clipboard".to_string()]);
+}
+
+#[test]
+fn get_mux_fallback_resolves_device_prefix() {
+    let reg = PluginRegistry::new();
+    let caps = vec!["geo".to_string(), "battery".to_string()];
+    reg.register_device(
+        "dev-123".to_string(),
+        10,
+        caps.clone(),
+        dummy_manifest(),
+        dummy_write_tx(),
+        DeviceMeta {
+            device_id: "dev-123".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        reg.get("dev-123.geo").is_none(),
+        "exact per-cap must not exist"
+    );
+    let mux = reg
+        .get_mux("dev-123.geo")
+        .expect("mux fallback must find device");
+    assert_eq!(mux.plugin_id, "dev-123");
+    assert!(
+        reg.get_mux("dev-123.unknown").is_none(),
+        "unknown cap must not resolve"
+    );
+    assert!(reg.get_mux("unknown").is_none());
+}

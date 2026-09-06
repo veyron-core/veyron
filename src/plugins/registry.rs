@@ -235,6 +235,126 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Mux single-WS per device (T1): one `PluginRegister{plugin_id=device_id,
+    /// capabilities=caps}` creates one entry with `plugin_id=device_id` and
+    /// `manifest.actions = caps.map(|c| format!("{device_id}.{c}"))`.
+    pub fn register_device(
+        &self,
+        device_id: String,
+        conn_id: u64,
+        caps: Vec<String>,
+        mut manifest: PluginManifest,
+        write_tx: mpsc::Sender<Outbound>,
+        meta: DeviceMeta,
+    ) -> Result<(), VynkorError> {
+        use dashmap::mapref::entry::Entry;
+
+        validate_plugin_id(&device_id)?;
+
+        let conn_slot = match self.by_conn_id.entry(conn_id) {
+            Entry::Occupied(_) => {
+                return Err(VynkorError::PluginAlreadyRegistered(format!(
+                    "connection {conn_id} already has a registered plugin"
+                )))
+            }
+            Entry::Vacant(v) => v,
+        };
+
+        let plugin_slot = match self.by_plugin_id.entry(device_id.clone()) {
+            Entry::Occupied(_) => return Err(VynkorError::PluginAlreadyRegistered(device_id)),
+            Entry::Vacant(v) => v,
+        };
+
+        let effective_device_id = if meta.device_id.is_empty() {
+            device_id.clone()
+        } else {
+            meta.device_id.clone()
+        };
+        let user_id = if meta.user_id.is_empty() {
+            "default"
+        } else {
+            &meta.user_id
+        };
+
+        let registered_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let now_ms = unix_millis();
+
+        // manifest.actions is the provider-declared action list — for a mux
+        // device it is the fully-qualified capability names
+        manifest.actions = caps.iter().map(|c| format!("{device_id}.{c}")).collect();
+
+        let entry = PluginEntry {
+            plugin_id: device_id.clone(),
+            conn_id,
+            manifest,
+            write_tx,
+            registered_at,
+            state: PluginState::Registered,
+            device_id: effective_device_id.clone(),
+            user_id: user_id.to_string(),
+        };
+
+        conn_slot.insert(device_id.clone());
+        self.pong_times.insert(device_id.clone(), Instant::now());
+        match self.devices.entry(effective_device_id.clone()) {
+            Entry::Occupied(mut occ) => {
+                let dev = occ.get_mut();
+                dev.last_seen = now_ms;
+                dev.state = DeviceState::Online as i32;
+                dev.os = meta.os as i32;
+                dev.arch = meta.arch.clone();
+                dev.os_version = meta.os_version.clone();
+                dev.capabilities = caps.clone();
+            }
+            Entry::Vacant(v) => {
+                v.insert(DeviceInfo {
+                    device_id: effective_device_id,
+                    os: meta.os as i32,
+                    arch: meta.arch.clone(),
+                    os_version: meta.os_version.clone(),
+                    capabilities: caps,
+                    last_seen: now_ms,
+                    state: DeviceState::Online as i32,
+                    created: 0,
+                    expires: 0,
+                });
+            }
+        }
+        plugin_slot.insert(entry);
+        Ok(())
+    }
+
+    /// Mux routing helper (T2): exact plugin_id or device prefix fallback.
+    /// `dev-xxx.geo` resolves to `dev-xxx` when the device registered via
+    /// single-WS. Returns cloned entry only if the cap is declared in the
+    /// mux device's manifest (unknown caps -> None).
+    pub fn get_mux(&self, target: &str) -> Option<PluginEntry> {
+        if let Some(entry) = self.get(target) {
+            return Some(entry);
+        }
+        let (dev, cap) = target.split_once('.')?;
+        let entry = self.get(dev)?;
+        // strict: only declared caps may route via the mux device
+        let is_declared = entry.manifest.actions.iter().any(|a| a == target)
+            || entry
+                .manifest
+                .actions
+                .iter()
+                .any(|a| a.split_once('.').is_some_and(|(_, c)| c == cap))
+            || self
+                .devices
+                .get(dev)
+                .is_some_and(|d| d.capabilities.iter().any(|c| c == cap));
+        if is_declared {
+            Some(entry)
+        } else {
+            None
+        }
+    }
+
     pub fn unregister(&self, plugin_id: &str) {
         if let Some((_, entry)) = self.by_plugin_id.remove(plugin_id) {
             self.by_conn_id.remove(&entry.conn_id);
