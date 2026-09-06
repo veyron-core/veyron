@@ -2097,3 +2097,167 @@ async fn routing_logs_ingress_and_relay_hops_with_message_id() {
         "target must appear in hop logs:\n{logs}"
     );
 }
+
+#[tokio::test]
+async fn forward_mux_geo_to_device_conn() {
+    let reg = Arc::new(PluginRegistry::new());
+    let bus = Arc::new(EventBus::new());
+
+    let caps = vec![
+        "battery".to_string(),
+        "geo".to_string(),
+        "clipboard".to_string(),
+    ];
+    let (dev_tx, mut dev_rx) = make_write_pair();
+    use vynkor::plugins::registry::DeviceMeta;
+    use vynkor::proto::vynkor::DeviceOs;
+    reg.register_device(
+        "dev-xxx".to_string(),
+        10,
+        caps.clone(),
+        dummy_manifest(),
+        dev_tx,
+        DeviceMeta {
+            device_id: "dev-xxx".to_string(),
+            user_id: "default".to_string(),
+            os: DeviceOs::Android,
+            arch: "aarch64".to_string(),
+            os_version: "14".to_string(),
+            capabilities: caps.clone(),
+        },
+    )
+    .unwrap();
+
+    let (sender_tx, _sender_rx) = make_write_pair();
+    reg.register(
+        "sender".to_string(),
+        1,
+        ipc_manifest_with_targets(vec!["dev-xxx.geo"]),
+        sender_tx.clone(),
+        "",
+        "",
+    )
+    .unwrap();
+
+    let router_tx = spawn_router(Arc::clone(&reg), bus);
+    let payload = b"mux hello".to_vec();
+    router_tx
+        .send(incoming(
+            1,
+            plug_frame("dev-xxx.geo", payload.clone()),
+            sender_tx.clone(),
+        ))
+        .await
+        .unwrap();
+
+    let received = recv_frame(&mut dev_rx).await;
+    assert_eq!(&*received.payload, payload);
+    assert_eq!(target_as_str(&received), Some("dev-xxx.geo"));
+
+    // also allowlist by device id should work (prefix fallback allowlist)
+    let (sender2_tx, _sender2_rx) = make_write_pair();
+    reg.register(
+        "sender2".to_string(),
+        2,
+        ipc_manifest_with_targets(vec!["dev-xxx"]),
+        sender2_tx.clone(),
+        "",
+        "",
+    )
+    .unwrap();
+    router_tx
+        .send(incoming(
+            2,
+            plug_frame("dev-xxx.battery", payload.clone()),
+            sender2_tx.clone(),
+        ))
+        .await
+        .unwrap();
+    let received2 = recv_frame(&mut dev_rx).await;
+    assert_eq!(&*received2.payload, payload);
+}
+
+#[tokio::test]
+async fn forward_mux_battery_to_device_conn_via_device_allowlist() {
+    let reg = Arc::new(PluginRegistry::new());
+    let bus = Arc::new(EventBus::new());
+    let caps = vec!["battery".to_string()];
+    let (dev_tx, mut dev_rx) = make_write_pair();
+    use vynkor::plugins::registry::DeviceMeta;
+    reg.register_device(
+        "dev-yyy".to_string(),
+        5,
+        caps.clone(),
+        dummy_manifest(),
+        dev_tx,
+        DeviceMeta {
+            device_id: "dev-yyy".to_string(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (sender_tx, _sender_rx) = make_write_pair();
+    reg.register(
+        "sender".to_string(),
+        1,
+        ipc_manifest_with_targets(vec!["dev-yyy"]),
+        sender_tx.clone(),
+        "",
+        "",
+    )
+    .unwrap();
+    let router_tx = spawn_router(Arc::clone(&reg), bus);
+    router_tx
+        .send(incoming(
+            1,
+            plug_frame("dev-yyy.battery", b"data".to_vec()),
+            sender_tx,
+        ))
+        .await
+        .unwrap();
+    let f = recv_frame(&mut dev_rx).await;
+    assert_eq!(target_as_str(&f), Some("dev-yyy.battery"));
+}
+
+#[tokio::test]
+async fn register_mux_via_router_single_ws_creates_one_entry() {
+    let reg = Arc::new(PluginRegistry::new());
+    let bus = Arc::new(EventBus::new());
+    let router_tx = spawn_router(Arc::clone(&reg), bus);
+    let (write_tx, mut write_rx) = make_write_pair();
+    let caps = vec!["battery".to_string(), "geo".to_string()];
+    let env = Envelope {
+        payload: Some(envelope::Payload::PluginRegister(PluginRegister {
+            plugin_id: "dev-mux".to_string(),
+            device_id: "dev-mux".to_string(),
+            capabilities: caps.clone(),
+            protocol_version: vynkor_wire::PROTOCOL_VERSION.to_string(),
+            manifest: Some(dummy_manifest()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    router_tx
+        .send(incoming(77, kernel_frame(env), write_tx))
+        .await
+        .unwrap();
+    let ack_frame = recv_frame(&mut write_rx).await;
+    let ack = decode_envelope(&ack_frame);
+    match ack.payload {
+        Some(envelope::Payload::PluginRegisterAck(a)) => assert!(
+            a.accepted,
+            "mux register must be accepted: {}",
+            a.reject_reason
+        ),
+        other => panic!("expected ack, got {other:?}"),
+    }
+    assert_eq!(reg.list().len(), 1);
+    let entry = reg.get("dev-mux").expect("must exist");
+    assert!(entry
+        .manifest
+        .actions
+        .contains(&"dev-mux.battery".to_string()));
+    assert!(entry.manifest.actions.contains(&"dev-mux.geo".to_string()));
+    let dev = reg.get_device("dev-mux").unwrap();
+    assert_eq!(dev.capabilities, caps);
+}

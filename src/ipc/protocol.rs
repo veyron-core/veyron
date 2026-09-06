@@ -498,20 +498,52 @@ impl MessageRouter {
                     }
                 }
 
-                let result = registry.register_with_device(
-                    plugin_id.clone(),
-                    msg.conn_id,
-                    manifest,
-                    msg.write_tx.clone(),
-                    DeviceMeta {
-                        device_id: reg.device_id.clone(),
-                        user_id: reg.user_id.clone(),
-                        os: DeviceOs::try_from(reg.os).unwrap_or(DeviceOs::Unspecified),
-                        arch: reg.arch.clone(),
-                        os_version: reg.os_version.clone(),
-                        capabilities: reg.capabilities.clone(),
-                    },
-                );
+                let is_mux_device = !reg.capabilities.is_empty()
+                    && !reg.device_id.is_empty()
+                    && reg.plugin_id == reg.device_id;
+
+                let result = if is_mux_device {
+                    registry.register_device(
+                        reg.device_id.clone(),
+                        msg.conn_id,
+                        reg.capabilities.clone(),
+                        manifest,
+                        msg.write_tx.clone(),
+                        DeviceMeta {
+                            device_id: reg.device_id.clone(),
+                            user_id: reg.user_id.clone(),
+                            os: DeviceOs::try_from(reg.os).unwrap_or(DeviceOs::Unspecified),
+                            arch: reg.arch.clone(),
+                            os_version: reg.os_version.clone(),
+                            capabilities: reg.capabilities.clone(),
+                        },
+                    )
+                } else {
+                    if !reg.device_id.is_empty()
+                        && reg.plugin_id.contains('.')
+                        && reg.plugin_id.starts_with(&format!("{}.", reg.device_id))
+                    {
+                        warn!(
+                            plugin_id = %plugin_id,
+                            device_id = %reg.device_id,
+                            "deprecated per-cap registration: use single-WS with plugin_id=device_id and capabilities=[...]"
+                        );
+                    }
+                    registry.register_with_device(
+                        plugin_id.clone(),
+                        msg.conn_id,
+                        manifest,
+                        msg.write_tx.clone(),
+                        DeviceMeta {
+                            device_id: reg.device_id.clone(),
+                            user_id: reg.user_id.clone(),
+                            os: DeviceOs::try_from(reg.os).unwrap_or(DeviceOs::Unspecified),
+                            arch: reg.arch.clone(),
+                            os_version: reg.os_version.clone(),
+                            capabilities: reg.capabilities.clone(),
+                        },
+                    )
+                };
 
                 // When auth is on, mint a per-registration nonce; the plugin and
                 // kernel both derive the frame-MAC key from it.
@@ -1139,17 +1171,61 @@ impl MessageRouter {
             return true;
         }
 
-        // Per-target allowlist (T-04): ipc_targets must explicitly list the target.
-        // Empty ipc_targets = deny-all even with PERMISSION_IPC_SEND.
-        if check_ipc_target(registry, &sender_id, plugin_id).is_err() {
-            warn!(sender = %sender_id, target = %plugin_id, "ipc target not in allowlist");
-            counter!("ipc_send_denied_total").increment(1);
-            Self::send_error(
-                &msg.write_tx,
-                ErrorCode::ErrPermissionDenied,
-                "target not in ipc_targets allowlist",
-            );
-            return true;
+        {
+            let sender_entry = match registry.get(&sender_id) {
+                Some(e) => e,
+                None => {
+                    warn!(sender = %sender_id, "sender vanished between checks");
+                    counter!("ipc_send_denied_total").increment(1);
+                    Self::send_error(
+                        &msg.write_tx,
+                        ErrorCode::ErrPermissionDenied,
+                        "sender not found",
+                    );
+                    return true;
+                }
+            };
+            let resolved_for_auth = registry.get_mux(plugin_id);
+            if let Some(ref target_entry) = resolved_for_auth {
+                if target_entry.user_id != sender_entry.user_id {
+                    warn!(
+                        sender = %sender_id,
+                        target = %plugin_id,
+                        sender_user = %sender_entry.user_id,
+                        target_user = %target_entry.user_id,
+                        "cross-user IPC denied (mux)"
+                    );
+                    counter!("ipc_send_denied_total").increment(1);
+                    Self::send_error(
+                        &msg.write_tx,
+                        ErrorCode::ErrPermissionDenied,
+                        "cross-user IPC denied",
+                    );
+                    return true;
+                }
+            }
+            let allowed = sender_entry
+                .manifest
+                .ipc_targets
+                .iter()
+                .any(|t| t == plugin_id)
+                || (plugin_id.contains('.') && resolved_for_auth.is_some() && {
+                    if let Some((dev, _)) = plugin_id.split_once('.') {
+                        sender_entry.manifest.ipc_targets.iter().any(|t| t == dev)
+                    } else {
+                        false
+                    }
+                });
+            if !allowed {
+                warn!(sender = %sender_id, target = %plugin_id, "ipc target not in allowlist");
+                counter!("ipc_send_denied_total").increment(1);
+                Self::send_error(
+                    &msg.write_tx,
+                    ErrorCode::ErrPermissionDenied,
+                    "target not in ipc_targets allowlist",
+                );
+                return true;
+            }
         }
 
         // Audio stream gate (T-06): raw binary frames require PERMISSION_AUDIO_STREAM.
@@ -1167,8 +1243,34 @@ impl MessageRouter {
             return true;
         }
 
-        match registry.get(plugin_id) {
+        let resolved = registry.get_mux(plugin_id);
+        let is_mux = resolved.is_some() && registry.get(plugin_id).is_none();
+        if is_mux {
+            counter!("ipc_forward_mux_total").increment(1);
+        }
+        match resolved {
             Some(entry) => {
+                // For device caps via direct target with empty action (mux single-WS),
+                // create a pending so the ActionResponse can be routed back to the caller.
+                // This mirrors the kernel-routed ActionRequest pending path.
+                if let Ok(env) = Envelope::decode(msg.frame.payload.as_ref()) {
+                    if let Some(envelope::Payload::ActionRequest(req)) = env.payload {
+                        if req.action.is_empty() && plugin_id.contains('.') {
+                            let pending = PendingAction {
+                                requester_write_tx: msg.write_tx.clone(),
+                                original_action_id: req.action_id.clone(),
+                                requester_id: sender_id.clone(),
+                                deadline: Instant::now()
+                                    + Duration::from_millis(30000),
+                                provider_id: entry.plugin_id.clone(),
+                                streaming: req.streaming,
+                                session_accepted: false,
+                                last_activity: Instant::now(),
+                            };
+                            registry.register_pending_action(req.action_id.clone(), pending);
+                        }
+                    }
+                }
                 // Strip FLAG_MAC_PRESENT: the recipient's write_loop re-tags with its own
                 // session key. Forwarding the sender's flag without a fresh tag corrupts
                 // the stream (mirrors broadcast()).
