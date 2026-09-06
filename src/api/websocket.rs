@@ -314,3 +314,39 @@ pub(crate) fn frame_to_bytes(frame: &Frame) -> Vec<u8> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers_with_protocol(val: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("sec-websocket-protocol", val.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn extract_ws_token_vynkor_prefix() {
+        let h = headers_with_protocol("vynkor, my.jwt.token");
+        assert_eq!(extract_ws_token(&h), "my.jwt.token");
+    }
+
+    #[test]
+    fn extract_ws_token_trims_spaces() {
+        let h = headers_with_protocol("vynkor,  spaced.token  ");
+        assert_eq!(extract_ws_token(&h), "spaced.token");
+    }
+
+    #[test]
+    fn extract_ws_token_empty_when_only_vynkor() {
+        let h = headers_with_protocol("vynkor");
+        assert_eq!(extract_ws_token(&h), "");
+    }
+
+    #[test]
+    fn extract_ws_token_empty_when_no_header() {
+        let h = HeaderMap::new();
+        assert_eq!(extract_ws_token(&h), "");
+    }
+}
