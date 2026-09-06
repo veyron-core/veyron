@@ -1260,8 +1260,7 @@ impl MessageRouter {
                                 requester_write_tx: msg.write_tx.clone(),
                                 original_action_id: req.action_id.clone(),
                                 requester_id: sender_id.clone(),
-                                deadline: Instant::now()
-                                    + Duration::from_millis(30000),
+                                deadline: Instant::now() + Duration::from_millis(30000),
                                 provider_id: entry.plugin_id.clone(),
                                 streaming: req.streaming,
                                 session_accepted: false,
