@@ -46,3 +46,4 @@ data/tmp/
 *.socket
 .worktrees/
 .cargo/
+.codegraph/
