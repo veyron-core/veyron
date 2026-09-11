@@ -170,12 +170,12 @@ pub async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<Device
             .into_iter()
             .map(|d| DeviceInfoView {
                 device_id: d.device_id,
-                os: crate::plugins::registry::device_os_str(d.os).to_string(),
+                os: crate::api::display::device_os_str(d.os).to_string(),
                 arch: d.arch,
                 os_version: d.os_version,
                 capabilities: d.capabilities,
                 last_seen: d.last_seen,
-                state: crate::plugins::registry::device_state_str(d.state).to_string(),
+                state: crate::api::display::device_state_str(d.state).to_string(),
                 created: d.created,
                 expires: d.expires,
             })

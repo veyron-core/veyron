@@ -710,30 +710,6 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-// D-04: display strings for wire DeviceOs/DeviceState values; unknown values
-// read back as "unspecified" so the discovery surface never panics
-pub fn device_os_str(os: i32) -> &'static str {
-    match DeviceOs::try_from(os) {
-        Ok(DeviceOs::Linux) => "linux",
-        Ok(DeviceOs::Macos) => "macos",
-        Ok(DeviceOs::Windows) => "windows",
-        Ok(DeviceOs::Android) => "android",
-        Ok(DeviceOs::Ios) => "ios",
-        Ok(DeviceOs::Freebsd) => "freebsd",
-        _ => "unspecified",
-    }
-}
-
-pub fn device_state_str(state: i32) -> &'static str {
-    match DeviceState::try_from(state) {
-        Ok(DeviceState::Online) => "online",
-        Ok(DeviceState::Offline) => "offline",
-        // E-01 (v1.7): revoked devices surface distinctly, never as "online"
-        Ok(DeviceState::Revoked) => "revoked",
-        _ => "unspecified",
-    }
-}
-
 // D-08: display strings for wire ActionRisk values — the tool-calling surface
 // (joined event + get_manifest) reads risk back as a lowercase string
 pub fn action_risk_str(risk: i32) -> &'static str {

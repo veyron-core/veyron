@@ -65,12 +65,12 @@ impl CommandHandler {
                     .map(|d| {
                         serde_json::json!({
                             "device_id": d.device_id,
-                            "os": crate::plugins::registry::device_os_str(d.os),
+                            "os": crate::api::display::device_os_str(d.os),
                             "arch": d.arch,
                             "os_version": d.os_version,
                             "capabilities": d.capabilities,
                             "last_seen": d.last_seen,
-                            "state": crate::plugins::registry::device_state_str(d.state),
+                            "state": crate::api::display::device_state_str(d.state),
                         })
                     })
                     .collect();

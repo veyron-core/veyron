@@ -1,8 +1,9 @@
+use crate::api::display::device_os_str;
 use crate::events::store::EventStore;
 use crate::ipc::connection::out_frame;
 use crate::ipc::framing::build_frame;
 use crate::ipc::protocol::kernel_message_id;
-use crate::plugins::registry::{device_os_str, PluginRegistry};
+use crate::plugins::registry::PluginRegistry;
 use crate::proto::vynkor::{envelope, Envelope, Event};
 use dashmap::DashMap;
 use metrics::counter;
