@@ -166,6 +166,12 @@ pub struct Config {
     /// accept/reject window is still governed by ActionRequest.timeout_ms.
     #[serde(default)]
     pub session_idle_timeout_secs: Option<u32>,
+    /// Interval (seconds) between the router's periodic prune sweep (evict
+    /// idle rate-limit keys, sweep expired actions, sweep idle sessions).
+    /// Default: 60s in production. Tests set this to 2–5s for fast timeout
+    /// coverage.
+    #[serde(default = "default_prune_interval_secs")]
+    pub prune_interval_secs: u64,
     /// TLS for the network path — **on by default** (D-07). When no
     /// cert/key are configured the kernel generates a self-signed pair on
     /// first start; set `tls: false` to serve plain HTTP (insecure).
@@ -317,6 +323,9 @@ fn default_log_buffer_lines() -> usize {
 fn default_max_connections() -> usize {
     1024
 }
+fn default_prune_interval_secs() -> u64 {
+    60
+}
 fn default_registry_cache_ttl_secs() -> u64 {
     3600
 }
@@ -406,6 +415,7 @@ impl Default for Config {
             action_caller_rate_limit_rps: None,
             action_caller_max_concurrent: None,
             session_idle_timeout_secs: None,
+            prune_interval_secs: default_prune_interval_secs(),
             tls: default_tls(),
             tls_cert_path: None,
             tls_key_path: None,
