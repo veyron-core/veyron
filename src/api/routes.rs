@@ -22,6 +22,49 @@ pub struct AppState {
     pub plugin_defs: Vec<PluginDef>,
 }
 
+/// Uniform JSON envelope for every non-2xx REST response (UX-1). Clients parse
+/// one shape — `{code, message, retryable}` — instead of matching on bare
+/// status codes or empty bodies.
+#[derive(Serialize)]
+pub struct ApiError {
+    pub code: u16,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ApiError {
+    fn body(
+        code: StatusCode,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> (StatusCode, Json<ApiError>) {
+        (
+            code,
+            Json(ApiError {
+                code: code.as_u16(),
+                message: message.into(),
+                retryable,
+            }),
+        )
+    }
+
+    pub fn not_found(msg: &str) -> (StatusCode, Json<ApiError>) {
+        Self::body(StatusCode::NOT_FOUND, msg, false)
+    }
+
+    pub fn conflict(msg: &str) -> (StatusCode, Json<ApiError>) {
+        Self::body(StatusCode::CONFLICT, msg, false)
+    }
+
+    pub fn unprocessable(msg: &str) -> (StatusCode, Json<ApiError>) {
+        Self::body(StatusCode::UNPROCESSABLE_ENTITY, msg, false)
+    }
+
+    pub fn forbidden(msg: &str) -> (StatusCode, Json<ApiError>) {
+        Self::body(StatusCode::FORBIDDEN, msg, false)
+    }
+}
+
 #[derive(Serialize)]
 pub struct Health {
     pub status: &'static str,
@@ -142,55 +185,84 @@ pub async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<Device
 
 /// Spawn a plugin declared under `plugins:` in config.yaml. 404 when `id`
 /// isn't declared there (this never runs an arbitrary binary path);
-/// 409 when it's already supervised.
+/// 409 when it's already supervised. Errors carry the JSON envelope (UX-1).
 pub async fn start_plugin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> StatusCode {
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     if state.manager.is_supervised(&id) {
-        return StatusCode::CONFLICT;
+        return Err(ApiError::conflict(&format!(
+            "plugin '{id}' is already running"
+        )));
     }
     let def = match state.plugin_defs.iter().find(|d| d.id == id) {
         Some(d) => d,
-        None => return StatusCode::NOT_FOUND,
+        None => {
+            return Err(ApiError::not_found(&format!(
+                "plugin '{id}' is not declared in config"
+            )))
+        }
     };
     match validate_plugin_def(def) {
         Ok(_) => {}
-        Err(VynkorError::PermissionDenied(_)) => return StatusCode::FORBIDDEN,
-        Err(_) => return StatusCode::UNPROCESSABLE_ENTITY,
+        Err(VynkorError::PermissionDenied(_)) => {
+            return Err(ApiError::forbidden(
+                "plugin requests a permission not granted by config",
+            ))
+        }
+        Err(_) => {
+            return Err(ApiError::unprocessable(
+                "plugin definition failed validation",
+            ))
+        }
     }
     let config = PluginLoader::config_from_def(def);
     match state.manager.start(config).await {
-        Ok(_) => StatusCode::OK,
-        Err(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        Ok(_) => Ok(StatusCode::OK),
+        Err(_) => Err(ApiError::unprocessable(&format!(
+            "failed to start plugin '{id}'"
+        ))),
     }
 }
 
 /// Stop a supervised plugin and remove its registration (manager unregisters
 /// regardless of the stop outcome). 404 when `id` has no supervised process —
 /// including one that exited between the registry check and the stop.
-pub async fn stop_plugin(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> StatusCode {
+pub async fn stop_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     if state.manager.get(&id).is_none() {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::not_found(&format!(
+            "plugin '{id}' is not registered"
+        )));
     }
     match state.manager.stop(&id).await {
-        Ok(()) => StatusCode::OK,
+        Ok(()) => Ok(StatusCode::OK),
         // ux-1: race with plugin exit is a miss, not a success
-        Err(VynkorError::PluginNotFound(_)) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        Err(VynkorError::PluginNotFound(_)) => Err(ApiError::not_found(&format!(
+            "plugin '{id}' exited before stop completed"
+        ))),
+        Err(_) => Err(ApiError::unprocessable(&format!(
+            "failed to stop plugin '{id}'"
+        ))),
     }
 }
 
 pub async fn restart_plugin(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> StatusCode {
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     if state.manager.get(&id).is_none() {
-        return StatusCode::NOT_FOUND;
+        return Err(ApiError::not_found(&format!(
+            "plugin '{id}' is not registered"
+        )));
     }
     match state.manager.restart(&id).await {
-        Ok(()) => StatusCode::ACCEPTED,
-        Err(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        Ok(()) => Ok(StatusCode::ACCEPTED),
+        Err(_) => Err(ApiError::unprocessable(&format!(
+            "failed to restart plugin '{id}'"
+        ))),
     }
 }
 
@@ -208,9 +280,11 @@ pub async fn get_plugin_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     Query(q): Query<LogsQuery>,
-) -> Result<Json<Vec<String>>, StatusCode> {
+) -> Result<Json<Vec<String>>, (StatusCode, Json<ApiError>)> {
     if state.manager.get(&id).is_none() && !state.manager.is_supervised(&id) {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::not_found(&format!(
+            "plugin '{id}' is not registered"
+        )));
     }
     let n = q.lines.unwrap_or(100).min(MAX_LOG_LINES);
     Ok(Json(state.manager.logs(&id, n).await))
