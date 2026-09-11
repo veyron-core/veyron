@@ -229,7 +229,7 @@ pub async fn run_retry_worker(
 pub fn plugin_lifecycle_payload(registry: &PluginRegistry, plugin_id: &str) -> Vec<u8> {
     let device_id = registry
         .get(plugin_id)
-        .map(|e| e.device_id)
+        .map(|e| e.device_id.clone())
         .unwrap_or_default();
     let (os, capabilities) = match registry.get_device(&device_id) {
         Some(dev) => (device_os_str(dev.os).to_string(), dev.capabilities),
@@ -240,7 +240,7 @@ pub fn plugin_lifecycle_payload(registry: &PluginRegistry, plugin_id: &str) -> V
     // kernel never interprets params_schema.
     let action_specs: Vec<serde_json::Value> = registry
         .get(plugin_id)
-        .map(|e| e.manifest.action_specs)
+        .map(|e| e.manifest.action_specs.clone())
         .unwrap_or_default()
         .iter()
         .map(|s| {

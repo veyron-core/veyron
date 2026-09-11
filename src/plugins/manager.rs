@@ -19,7 +19,7 @@ impl PluginManager {
         }
     }
 
-    pub fn list(&self) -> Vec<PluginEntry> {
+    pub fn list(&self) -> Vec<Arc<PluginEntry>> {
         self.registry.list()
     }
 
@@ -27,7 +27,7 @@ impl PluginManager {
         &self.registry
     }
 
-    pub fn get(&self, plugin_id: &str) -> Option<PluginEntry> {
+    pub fn get(&self, plugin_id: &str) -> Option<Arc<PluginEntry>> {
         self.registry.get(plugin_id)
     }
 

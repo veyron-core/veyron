@@ -66,11 +66,11 @@ pub async fn list_plugins(State(state): State<Arc<AppState>>) -> Json<Vec<Plugin
                 .map(|d| d.last_seen)
                 .unwrap_or(0);
             PluginInfo {
-                plugin_id: e.plugin_id,
+                plugin_id: e.plugin_id.clone(),
                 state: crate::plugins::registry::plugin_state_str(&e.state).to_string(),
                 registered_at: e.registered_at,
-                permissions: e.manifest.permissions,
-                device_id: e.device_id,
+                permissions: e.manifest.permissions.clone(),
+                device_id: e.device_id.clone(),
                 last_seen,
             }
         })
@@ -93,11 +93,11 @@ pub async fn get_plugin(
                 .map(|d| d.last_seen)
                 .unwrap_or(0);
             Json(PluginInfo {
-                plugin_id: e.plugin_id,
+                plugin_id: e.plugin_id.clone(),
                 state: crate::plugins::registry::plugin_state_str(&e.state).to_string(),
                 registered_at: e.registered_at,
-                permissions: e.manifest.permissions,
-                device_id: e.device_id,
+                permissions: e.manifest.permissions.clone(),
+                device_id: e.device_id.clone(),
                 last_seen,
             })
         })
