@@ -236,9 +236,9 @@ pub fn plugin_lifecycle_payload(registry: &PluginRegistry, plugin_id: &str) -> V
         Some(dev) => (device_os_str(dev.os).to_string(), dev.capabilities),
         None => ("unspecified".to_string(), vec![]),
     };
-    // D-08: surface the action schema (action_specs) so clients can enumerate
-    // callable actions from the joined event alone. Registry data only — the
-    // kernel never interprets params_schema.
+    // D-08: surface action_specs so clients can enumerate callable actions
+    // from the joined event. Registry data only — the kernel never
+    // interprets params_schema.
     let action_specs: Vec<serde_json::Value> = registry
         .get(plugin_id)
         .map(|e| e.manifest.action_specs.clone())

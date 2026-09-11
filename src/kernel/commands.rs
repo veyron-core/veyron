@@ -77,7 +77,7 @@ impl CommandHandler {
                 CommandOutcome::ok(serde_json::Value::Array(devices).to_string())
             }
             // D-08: manifest surface — serve a plugin's manifest (incl.
-            // action_specs) to callers. Registry data only, no interpretation.
+            // action_specs). Registry data only, no interpretation.
             // params_json: {"plugin_id": "..."}.
             "get_manifest" => {
                 let plugin_id = serde_json::from_slice::<serde_json::Value>(params_json)

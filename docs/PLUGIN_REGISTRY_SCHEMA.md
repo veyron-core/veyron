@@ -260,11 +260,15 @@ Plugin '<plugin_id>' requests permission '<perm>' which is not granted in config
 ### Action-routing authorization (data-driven anti-laundering)
 
 At action-routing time, the kernel resolves the permission a caller must hold to invoke an
-action from the **provider-declared per-action permission** (`actions[].permission`, Manifest v2),
-falling back to the built-in map (`required_permission_for_action`) for legacy string-form
-manifests and plugins without a `plugin.json`. When a requirement exists, **both** the provider
-and the requester must hold the permission — checking the provider alone would let an
-unprivileged plugin launder the action through a permitted provider (T-19).
+action from the **provider-declared per-action permission** (`actions[].permission`, Manifest v2).
+When a requirement exists, **both** the provider and the requester must hold the permission —
+checking the provider alone would let an unprivileged plugin launder the action through a
+permitted provider (T-19).
+
+Actions without a v2 `action_requirement` are unrestricted by default. The legacy hardcoded
+fallback (`required_permission_for_action`) has been removed (F5). Plugins that previously
+relied on the implicit `http_request → network` mapping MUST declare `action_requirement`
+in their v2 manifest.
 
 ---
 

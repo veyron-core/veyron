@@ -21,7 +21,7 @@ name = "integration"
 path = "tests/integration/mod.rs"
 
 [dependencies]
-vynkor-wire = { version = "0.0.3", features = ["manifest"] }
+vynkor-wire = { version = "0.0.4", features = ["manifest"] }
 tokio = { version = "1", features = ["full"] }
 
 axum = { version = "0.8", features = ["ws"] }
@@ -100,7 +100,7 @@ sha2 = "0.10"
 flate2 = "1"
 
 [patch.crates-io]
-# E-01: proto 1.7 / wire 0.0.3 — local until published to crates.io; drop this
+# E-01: proto 1.7 / wire 0.0.4 — local until published to crates.io; drop this
 # section once the release is out (see vynkor-wire README "Releasing").
 # vynkor-sdk is patched too so dev-dependency tests see ONE wire crate (its
 # 0.0.2 requirement resolves to the same local source).
