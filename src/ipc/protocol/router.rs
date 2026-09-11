@@ -79,45 +79,45 @@ impl MessageRouter {
         mac_secret: Option<Arc<Vec<u8>>>,
         // T-04: operator-declared `config.yaml` `permissions:` allowlist per
         // plugin id. Registration clamps JWT/manifest-claimed permissions to
-        // this list so a token can't grant more than the operator configured.
+        // this list so a token can't grant more than the operator configured
         // `None`/missing-entry plugins (not declared in config.yaml) are left
         // unclamped — matches `validate_plugin_def`'s existing boot-time rule
-        // that an absent/empty list means "no restriction".
+        // that an absent/empty list means "no restriction"
         config_permissions: Option<Arc<HashMap<String, Vec<String>>>>,
         ipc_rate_limit_rps: Option<u32>,
         // R6-03: per-(caller, provider) action quota. Both None = unlimited,
-        // matching ipc_rate_limit_rps's existing opt-in convention.
+        // matching ipc_rate_limit_rps's existing opt-in convention
         action_caller_rate_limit_rps: Option<u32>,
         action_caller_max_concurrent: Option<u32>,
         action_timeout_ms: u32,
         max_conn_errors: u32,
         max_tracked_error_conns: usize,
         // R6-04: idle-timeout bound for accepted streaming sessions. None =
-        // disabled, matching action_caller_rate_limit_rps's unlimited convention.
+        // disabled, matching action_caller_rate_limit_rps's unlimited convention
         session_idle_timeout_secs: Option<u32>,
         // E-01: per-device credential store. When auth is on, any registration
         // declaring a device_id must present an active row here, and the
-        // frame-MAC key for that connection derives from the row's secret.
+        // frame-MAC key for that connection derives from the row's secret
         device_store: Option<Arc<crate::auth::device_store::DeviceStore>>,
         // D-06: relay for `role: client` kernels — frames whose target is not
-        // in the local registry fall through to the remote host.
+        // in the local registry fall through to the remote host
         bridge: Option<BridgeHandle>,
     ) {
-        // Per-connection protocol-error budget. A connection that produces a burst
+        // per-connection protocol-error budget. A connection that produces a burst
         // of malformed/denied/unhandled messages (which each generate an error
         // response) gets throttled: further messages are dropped without a reply,
-        // capping the amplification a single misbehaving plugin can cause (VULN-007).
-        // A successful message resets the budget, so transient errors don't accrue.
+        // capping the amplification a single misbehaving plugin can cause (VULN-007)
+        // a successful message resets the budget, so transient errors don't accrue
         //
-        // Keyed by conn_id -> (count, last_error_at). Pruned by staleness, not
+        // keyed by conn_id -> (count, last_error_at). Pruned by staleness, not
         // registration status (T-08): an unregistered connection is never
         // "registered" so a registration-status prune would keep evicting its
         // own entry back to zero every time the map hit capacity, letting it
-        // reset its own budget indefinitely by staying unregistered.
+        // reset its own budget indefinitely by staying unregistered
         let mut error_counts: HashMap<u64, (u32, Instant)> = HashMap::new();
         const ERROR_BUDGET_IDLE_TTL: Duration = Duration::from_secs(300);
 
-        // Per-connection IPC send rate limiter keyed by conn_id.
+        // per-connection IPC send rate limiter keyed by conn_id
         let ipc_limiter: Option<Arc<DefaultKeyedRateLimiter<u64>>> =
             ipc_rate_limit_rps.and_then(|rps| {
                 NonZeroU32::new(rps).map(|r| Arc::new(RateLimiter::keyed(Quota::per_second(r))))
@@ -125,7 +125,7 @@ impl MessageRouter {
 
         // R6-03: per-(caller, provider) action rate limiter. Keyed by a tuple so
         // hammering one provider doesn't burn a caller's budget against an
-        // unrelated provider it also legitimately calls.
+        // unrelated provider it also legitimately calls
         let action_limiter: Option<Arc<DefaultKeyedRateLimiter<(String, String)>>> =
             action_caller_rate_limit_rps.and_then(|rps| {
                 NonZeroU32::new(rps).map(|r| Arc::new(RateLimiter::keyed(Quota::per_second(r))))
@@ -134,7 +134,7 @@ impl MessageRouter {
         // conn_ids are monotonically assigned and never reused, so without
         // periodic eviction this keyed state grows for the life of the
         // process (AUDIT M-01). Evict idle keys on the same cadence as the
-        // error-budget map prune.
+        // error-budget map prune
         let mut prune_tick = tokio::time::interval(Duration::from_secs(60));
         prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -182,7 +182,7 @@ impl MessageRouter {
             };
             let conn_id = msg.conn_id;
 
-            // Per-plugin IPC rate limit: send ERR_RATE_LIMITED without disconnecting.
+            // per-plugin IPC rate limit: send ERR_RATE_LIMITED without disconnecting
             if let Some(limiter) = &ipc_limiter {
                 if limiter.check_key(&conn_id).is_err() {
                     counter!("ipc_send_denied_total").increment(1);
@@ -229,7 +229,7 @@ impl MessageRouter {
 
             // D-10: hop-0 trace log. `envelope_message_id` is a best-effort
             // read for observability only — routing stays payload-free
-            // (zero-parse); a raw/undecodable payload just logs an empty id.
+            // (zero-parse); a raw/undecodable payload just logs an empty id
             let trace_mid = envelope_message_id(&msg.frame);
             let trace_sender = registry
                 .get_by_conn_id(msg.conn_id)
@@ -292,7 +292,7 @@ impl MessageRouter {
                     counter!("ipc_throttled_connections_total").increment(1);
                 }
             } else {
-                // Well-behaved message — clear any accrued error budget.
+                // well-behaved message — clear any accrued error budget
                 error_counts.remove(&conn_id);
             }
         }
@@ -336,7 +336,7 @@ impl MessageRouter {
             }
         };
 
-        // Allow PluginRegister from unregistered senders; all others require registration
+        // allow PluginRegister from unregistered senders; all others require registration
         let is_register = matches!(envelope.payload, Some(envelope::Payload::PluginRegister(_)));
         if !is_register && !registry.is_registered(msg.conn_id) {
             send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
@@ -350,7 +350,7 @@ impl MessageRouter {
 
                 // D-03: reject on protocol_version *major* mismatch (minor/
                 // patch accepted). Empty protocol_version = a v1.5 host
-                // plugin (or a stale SDK) — accept, it predates the field.
+                // plugin (or a stale SDK) — accept, it predates the field
                 let wire_major = vynkor_wire::PROTOCOL_VERSION
                     .split('.')
                     .next()
@@ -375,14 +375,14 @@ impl MessageRouter {
                         Ok(claims) => {
                             // D-03: a device-scoped token (sub == device_id)
                             // authorizes every plugin of that device; a
-                            // plugin-scoped token (sub == plugin_id) as before.
+                            // plugin-scoped token (sub == plugin_id) as before
                             let device_match =
                                 !reg.device_id.is_empty() && claims.sub == reg.device_id;
                             if claims.sub != plugin_id && !device_match {
                                 send_register_reject(&msg.write_tx, "token plugin_id mismatch");
                                 return true;
                             }
-                            // Token fields take precedence over manifest declaration
+                            // token fields take precedence over manifest declaration
                             manifest.permissions = claims.permissions;
                             manifest.ipc_targets = claims.ipc_targets;
                         }
@@ -398,7 +398,7 @@ impl MessageRouter {
                 // auth-enabled kernel must present an active, unexpired
                 // credential row; the connection's frame-MAC key then derives
                 // from that row's secret instead of the master. Empty device_id
-                // = local plugin, unchanged master-secret path.
+                // = local plugin, unchanged master-secret path
                 let mut device_secret: Option<Vec<u8>> = None;
                 if !reg.device_id.is_empty() && mac_secret.is_some() {
                     if let Some(store) = device_store {
@@ -421,10 +421,10 @@ impl MessageRouter {
                 }
 
                 // T-04: clamp to the operator's config.yaml allowlist for this
-                // plugin id, so a JWT can't grant more than config.yaml allows.
-                // No entry for this id (not config.yaml-declared) or an empty
+                // plugin id, so a JWT can't grant more than config.yaml allows
+                // no entry for this id (not config.yaml-declared) or an empty
                 // list (operator placed no restriction) leaves it unclamped —
-                // same convention as `validate_plugin_def`.
+                // same convention as `validate_plugin_def`
                 if let Some(allowed) = config_permissions.and_then(|m| m.get(&plugin_id)) {
                     if !allowed.is_empty() {
                         // normalize both sides (N2): config.yaml may list the
@@ -491,8 +491,8 @@ impl MessageRouter {
                     )
                 };
 
-                // When auth is on, mint a per-registration nonce; the plugin and
-                // kernel both derive the frame-MAC key from it.
+                // when auth is on, mint a per-registration nonce; the plugin and
+                // kernel both derive the frame-MAC key from it
                 let session_nonce: Vec<u8> = if mac_secret.is_some() && result.is_ok() {
                     use rand::RngCore;
                     let mut n = vec![0u8; crate::auth::frame_mac::SESSION_NONCE_LEN];
@@ -535,12 +535,12 @@ impl MessageRouter {
                 };
                 send_envelope(&msg.write_tx, response);
 
-                // Enable the frame MAC for this connection: derive the key, store
+                // enable the frame MAC for this connection: derive the key, store
                 // it for inbound verification, and tell the write loop (ordered
-                // after the ack just sent) to start tagging outbound frames.
+                // after the ack just sent) to start tagging outbound frames
                 if let (Some(secret), true) = (&mac_secret, result.is_ok()) {
                     // E-01: device-scoped connections key the MAC off their own
-                    // credential; everything else keeps the master secret.
+                    // credential; everything else keeps the master secret
                     let ikm: &[u8] = match &device_secret {
                         Some(s) => s.as_slice(),
                         None => secret.as_slice(),
@@ -548,9 +548,9 @@ impl MessageRouter {
                     let key =
                         crate::auth::frame_mac::derive_session_key(ikm, &session_nonce, &plugin_id);
                     // EnableMac installs the inbound key AND activates outbound tagging
-                    // inside the write_loop, after the ack has been written to the socket.
-                    // This prevents inbound MAC verification from activating before the
-                    // plugin has received the ack (VULN-020).
+                    // inside the write_loop, after the ack has been written to the socket
+                    // this prevents inbound MAC verification from activating before the
+                    // plugin has received the ack (VULN-020)
                     let _ = msg
                         .write_tx
                         .send(Outbound::EnableMac(key, msg.session_key.clone()))
@@ -680,13 +680,13 @@ impl MessageRouter {
 
                 // R5-07 (option b): route to a plugin that declared this action in
                 // its manifest — "declared it" is the entire authorization model
-                // for actions with no entry in `required_permission_for_action`.
-                // Ambiguous declarations (>1 provider) are refused rather than
-                // arbitrarily resolved.
+                // for actions with no entry in `required_permission_for_action`
+                // ambiguous declarations (>1 provider) are refused rather than
+                // arbitrarily resolved
                 //
                 // T-19: for actions that *do* have a required permission, that
-                // permission is checked on the requester as well as the provider.
-                // Checking the provider alone lets any plugin launder a
+                // permission is checked on the requester as well as the provider
+                // checking the provider alone lets any plugin launder a
                 // privileged action through a permitted provider (e.g. an
                 // unprivileged plugin calling `http_request` on the `network`
                 // provider gets a real network request performed on its
@@ -694,7 +694,7 @@ impl MessageRouter {
                 // provider to *perform* the action, not for arbitrary callers
                 // to *invoke* it. Actions with no required permission are
                 // unaffected: the provider-declares-authorization model still
-                // applies to them as-is.
+                // applies to them as-is
                 let not_found_status = match registry.find_action_provider(&req.action) {
                     ActionLookup::NotFound => Some(ActionStatus::ActionNotFound),
                     ActionLookup::Ambiguous(providers) => {
@@ -718,7 +718,7 @@ impl MessageRouter {
                     }
                     // R6-03: concurrency cap — checked before the rate limit since it's
                     // the direct fix for "one caller holds N provider slots open" and is
-                    // cheaper (a DashMap scan, no token-bucket state touch) to fail fast on.
+                    // cheaper (a DashMap scan, no token-bucket state touch) to fail fast on
                     ActionLookup::Found(ref provider)
                         if action_caller_max_concurrent.is_some_and(|cap| {
                             registry.count_pending_actions_for(&sender_id, &provider.plugin_id)
@@ -730,7 +730,7 @@ impl MessageRouter {
                         Some(ActionStatus::ActionQuotaExceeded)
                     }
                     // R6-03: rate limit — keyed by (caller, provider), same governor
-                    // crate/pattern as the existing per-conn ipc_limiter.
+                    // crate/pattern as the existing per-conn ipc_limiter
                     ActionLookup::Found(ref provider)
                         if action_limiter.is_some_and(|limiter| {
                             limiter
@@ -774,10 +774,10 @@ impl MessageRouter {
                                 params_json: req.params_json.clone(),
                                 timeout_ms: req.timeout_ms,
                                 streaming: req.streaming,
-                                // Stamped from the authenticated sender_id, never
+                                // stamped from the authenticated sender_id, never
                                 // from req.caller_plugin_id — the inbound value
                                 // (if any) is discarded here, making this field
-                                // unspoofable by the caller.
+                                // unspoofable by the caller
                                 caller_plugin_id: sender_id.clone(),
                             })),
                             ..Default::default()
@@ -806,15 +806,15 @@ impl MessageRouter {
             }
 
             Some(envelope::Payload::ActionResponse(resp)) => {
-                // A provider plugin answering a kernel-routed ActionRequest always
+                // a provider plugin answering a kernel-routed ActionRequest always
                 // targets "kernel" (it doesn't know who really asked) — this is
                 // where the kernel translates the internal correlation id back to
-                // the original requester's action_id and proxies the response.
-                // Resolve the sender's identity BEFORE touching the pending-action
+                // the original requester's action_id and proxies the response
+                // resolve the sender's identity BEFORE touching the pending-action
                 // map. We must not remove the entry unless the sender is actually
                 // the provider it was routed to — otherwise any registered plugin
                 // could spoof or steal another provider's response by guessing the
-                // sequential internal action_id (AUDIT: response-spoofing gap).
+                // sequential internal action_id (AUDIT: response-spoofing gap)
                 let sender_plugin_id = registry
                     .get_by_conn_id(msg.conn_id)
                     .map(|e| e.plugin_id.clone());
@@ -904,12 +904,12 @@ impl MessageRouter {
             }
 
             Some(envelope::Payload::ActionResponseChunk(chunk)) => {
-                // Mirrors the ActionResponse arm above: the provider always
+                // mirrors the ActionResponse arm above: the provider always
                 // deals in internal-id space, so chunk.action_id here IS the
                 // internal id already — no reverse lookup needed, but the
                 // sender must be verified as the actual routed provider
                 // before we trust it (same spoofing concern as
-                // take_pending_action_if_provider).
+                // take_pending_action_if_provider)
                 let sender_plugin_id = registry
                     .get_by_conn_id(msg.conn_id)
                     .map(|e| e.plugin_id.clone());
@@ -959,7 +959,7 @@ impl MessageRouter {
                 // SessionClose can come from either peer. The provider always
                 // addresses by internal id (mirrors ActionResponseChunk); the
                 // requester only knows its own action_id and needs the same
-                // reverse lookup ActionRequestChunk uses.
+                // reverse lookup ActionRequestChunk uses
                 let resolved = match registry.get_pending_action(&close.action_id) {
                     Some(pending) if pending.provider_id == sender_id => {
                         Some((close.action_id.clone(), pending, true))
@@ -1095,7 +1095,7 @@ impl MessageRouter {
             }
         };
 
-        // Default-deny peer-to-peer IPC: sender must hold PERMISSION_IPC_SEND.
+        // default-deny peer-to-peer IPC: sender must hold PERMISSION_IPC_SEND
         if check_ipc_send(registry, &sender_id).is_err() {
             warn!(sender = %sender_id, target = %plugin_id, "ipc send denied");
             counter!("ipc_send_denied_total").increment(1);
@@ -1164,7 +1164,7 @@ impl MessageRouter {
             }
         }
 
-        // Audio stream gate (T-06): raw binary frames require PERMISSION_AUDIO_STREAM.
+        // audio stream gate (T-06): raw binary frames require PERMISSION_AUDIO_STREAM
         if msg.frame.flags & FLAG_RAW_BINARY != 0
             && check_permission(registry, &sender_id, PermissionType::PermissionAudioStream)
                 .is_err()
@@ -1186,9 +1186,9 @@ impl MessageRouter {
         }
         match resolved {
             Some(entry) => {
-                // For device caps via direct target with empty action (mux single-WS),
-                // create a pending so the ActionResponse can be routed back to the caller.
-                // This mirrors the kernel-routed ActionRequest pending path.
+                // for device caps via direct target with empty action (mux single-WS),
+                // create a pending so the ActionResponse can be routed back to the caller
+                // this mirrors the kernel-routed ActionRequest pending path
                 if let Ok(env) = Envelope::decode(msg.frame.payload.as_ref()) {
                     if let Some(envelope::Payload::ActionRequest(req)) = env.payload {
                         if req.action.is_empty() && plugin_id.contains('.') {
@@ -1206,9 +1206,9 @@ impl MessageRouter {
                         }
                     }
                 }
-                // Strip FLAG_MAC_PRESENT: the recipient's write_loop re-tags with its own
+                // strip FLAG_MAC_PRESENT: the recipient's write_loop re-tags with its own
                 // session key. Forwarding the sender's flag without a fresh tag corrupts
-                // the stream (mirrors broadcast()).
+                // the stream (mirrors broadcast())
                 let frame = Frame {
                     magic: msg.frame.magic,
                     flags: msg.frame.flags & !crate::ipc::framing::FLAG_MAC_PRESENT,
@@ -1218,9 +1218,9 @@ impl MessageRouter {
                     payload: msg.frame.payload.clone(),
                     mac: None,
                 };
-                // Non-blocking send: a slow/full target must not block the router.
-                // Dropping one frame for a non-draining plugin is not the sender's
-                // fault, so this is not counted against the sender's error budget.
+                // non-blocking send: a slow/full target must not block the router
+                // dropping one frame for a non-draining plugin is not the sender's
+                // fault, so this is not counted against the sender's error budget
                 debug!(
                     message_id = %message_id,
                     sender_id = %sender_id,
@@ -1237,7 +1237,7 @@ impl MessageRouter {
             None => {
                 // D-06: a `role: client` kernel relays unresolvable targets to
                 // the remote host before failing — the frame's target may live
-                // on the host (or behind another bridged device).
+                // on the host (or behind another bridged device)
                 if let Some(b) = bridge {
                     if b.relay_to_host(&msg.frame) {
                         return false;
@@ -1259,7 +1259,7 @@ impl MessageRouter {
             }
         };
 
-        // Default-deny: broadcasting is peer-to-peer fan-out — same gate as unicast.
+        // default-deny: broadcasting is peer-to-peer fan-out — same gate as unicast
         if check_ipc_send(registry, &sender_id).is_err() {
             warn!(sender = %sender_id, "broadcast denied");
             counter!("ipc_send_denied_total").increment(1);
@@ -1271,7 +1271,7 @@ impl MessageRouter {
             return true;
         }
 
-        // Audio stream gate (T-06): raw binary broadcast requires PERMISSION_AUDIO_STREAM.
+        // audio stream gate (T-06): raw binary broadcast requires PERMISSION_AUDIO_STREAM
         if msg.frame.flags & FLAG_RAW_BINARY != 0
             && check_permission(registry, &sender_id, PermissionType::PermissionAudioStream)
                 .is_err()
@@ -1291,13 +1291,13 @@ impl MessageRouter {
             if entry.conn_id == msg.conn_id {
                 continue; // skip sender
             }
-            // Per-target allowlist check: mirrors forward(). Empty ipc_targets = deny-all.
+            // per-target allowlist check: mirrors forward(). Empty ipc_targets = deny-all
             if check_ipc_target(registry, &sender_id, &entry.plugin_id).is_err() {
                 counter!("ipc_send_denied_total").increment(1);
                 continue;
             }
-            // Strip FLAG_MAC_PRESENT: the recipient's write_loop re-tags with its own
-            // session key. Forwarding the sender's flag without a fresh tag corrupts the stream.
+            // strip FLAG_MAC_PRESENT: the recipient's write_loop re-tags with its own
+            // session key. Forwarding the sender's flag without a fresh tag corrupts the stream
             let frame = Frame {
                 magic: msg.frame.magic,
                 flags: msg.frame.flags & !crate::ipc::framing::FLAG_MAC_PRESENT,

@@ -162,7 +162,7 @@ pub struct DeviceInfoView {
     pub expires: u64,
 }
 
-// D-04: discovery surface — the registry's device map as a serializable view.
+// D-04: discovery surface — the registry's device map as a serializable view
 pub async fn list_devices(State(state): State<Arc<AppState>>) -> Json<Vec<DeviceInfoView>> {
     let devices = state.manager.registry().list_devices();
     Json(
