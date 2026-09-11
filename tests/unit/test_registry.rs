@@ -158,7 +158,7 @@ fn second_registration_on_same_conn_rejected_without_orphaning() {
     );
     assert!(reg.get("first").is_some(), "original must survive");
     assert_eq!(
-        reg.get_by_conn_id(7).map(|e| e.plugin_id),
+        reg.get_by_conn_id(7).map(|e| e.plugin_id.clone()),
         Some("first".to_string()),
         "conn must still map to the original plugin"
     );

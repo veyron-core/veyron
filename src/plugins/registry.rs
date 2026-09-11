@@ -3,6 +3,7 @@ use crate::proto::vynkor::{PermissionType, PluginManifest};
 use crate::utils::errors::VynkorError;
 use dashmap::DashMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
@@ -31,9 +32,11 @@ pub enum PluginState {
 #[derive(Debug, Clone)]
 pub enum ActionLookup {
     NotFound,
-    // boxed: PluginEntry carries the full manifest, and wire v1.6 grew it
-    // (platforms/action_specs) past clippy's large-enum-variant threshold
-    Found(Box<PluginEntry>),
+    // Arc: PluginEntry lives once in the registry; routing holds a cheap
+    // refcount bump instead of a deep clone (PERF-3). Pointer-sized, so no
+    // clippy large-enum-variant issue — the manifest sits behind the Arc on
+    // the heap, exactly as the previous Box<PluginEntry> did.
+    Found(Arc<PluginEntry>),
     /// Colliding plugin ids, for the caller to log.
     Ambiguous(Vec<String>),
 }
@@ -84,7 +87,7 @@ pub struct PluginEntry {
 }
 
 pub struct PluginRegistry {
-    by_plugin_id: DashMap<String, PluginEntry>,
+    by_plugin_id: DashMap<String, Arc<PluginEntry>>,
     by_conn_id: DashMap<u64, String>,
     pong_times: DashMap<String, Instant>,
     /// one record per device_id (D-02); `last_seen` advances on ping/pong
@@ -94,6 +97,14 @@ pub struct PluginRegistry {
     /// required PermissionType). Populated at load time from the manifest; the
     /// router consults it before the legacy hardcoded map.
     action_requirements: DashMap<String, HashMap<String, PermissionType>>,
+    /// action name → provider plugin_id, for O(1) routing lookups (PERF-3).
+    /// Holds the unambiguous single declarer; a second declarer of the same
+    /// action is evacuated to `ambiguous_actions` so routing keeps surfacing
+    /// the deploy misconfiguration instead of silently picking a winner.
+    action_index: DashMap<String, String>,
+    /// action name → colliding provider ids (≥2). Split from `action_index` so
+    /// the common unambiguous lookup stays a single map read.
+    ambiguous_actions: DashMap<String, Vec<String>>,
 }
 
 impl PluginRegistry {
@@ -105,6 +116,8 @@ impl PluginRegistry {
             devices: DashMap::new(),
             pending_actions: DashMap::new(),
             action_requirements: DashMap::new(),
+            action_index: DashMap::new(),
+            ambiguous_actions: DashMap::new(),
         }
     }
 
@@ -189,7 +202,7 @@ impl PluginRegistry {
             .as_secs();
         let now_ms = unix_millis();
 
-        let entry = PluginEntry {
+        let entry = Arc::new(PluginEntry {
             plugin_id: plugin_id.clone(),
             conn_id,
             manifest,
@@ -198,9 +211,13 @@ impl PluginRegistry {
             state: PluginState::Registered,
             device_id: device_id.to_string(),
             user_id: user_id.to_string(),
-        };
+        });
 
         conn_slot.insert(plugin_id.clone());
+        // PERF-3: index each declared action for O(1) routing lookups
+        for action in &entry.manifest.actions {
+            self.index_action(action, &plugin_id);
+        }
         self.pong_times.insert(plugin_id, Instant::now());
         // a registering plugin proves its device is alive — upsert the record
         match self.devices.entry(device_id.to_string()) {
@@ -286,7 +303,7 @@ impl PluginRegistry {
         // device it is the fully-qualified capability names
         manifest.actions = caps.iter().map(|c| format!("{device_id}.{c}")).collect();
 
-        let entry = PluginEntry {
+        let entry = Arc::new(PluginEntry {
             plugin_id: device_id.clone(),
             conn_id,
             manifest,
@@ -295,9 +312,13 @@ impl PluginRegistry {
             state: PluginState::Registered,
             device_id: effective_device_id.clone(),
             user_id: user_id.to_string(),
-        };
+        });
 
         conn_slot.insert(device_id.clone());
+        // PERF-3: index each declared cap (fully-qualified action name)
+        for action in &entry.manifest.actions {
+            self.index_action(action, &device_id);
+        }
         self.pong_times.insert(device_id.clone(), Instant::now());
         match self.devices.entry(effective_device_id.clone()) {
             Entry::Occupied(mut occ) => {
@@ -331,7 +352,7 @@ impl PluginRegistry {
     /// `dev-xxx.geo` resolves to `dev-xxx` when the device registered via
     /// single-WS. Returns cloned entry only if the cap is declared in the
     /// mux device's manifest (unknown caps -> None).
-    pub fn get_mux(&self, target: &str) -> Option<PluginEntry> {
+    pub fn get_mux(&self, target: &str) -> Option<Arc<PluginEntry>> {
         if let Some(entry) = self.get(target) {
             return Some(entry);
         }
@@ -360,6 +381,10 @@ impl PluginRegistry {
             self.by_conn_id.remove(&entry.conn_id);
             self.pong_times.remove(plugin_id);
             self.clear_action_requirements(plugin_id);
+            // PERF-3: drop this plugin's action→provider index entries
+            for action in &entry.manifest.actions {
+                self.unindex_action(action, plugin_id);
+            }
             // D-02: a device is offline once none of its plugins remain
             let device_id = &entry.device_id;
             let still_registered = self.by_plugin_id.iter().any(|e| e.device_id == *device_id);
@@ -387,7 +412,7 @@ impl PluginRegistry {
         self.pong_times.get(plugin_id).map(|t| *t)
     }
 
-    pub fn get(&self, plugin_id: &str) -> Option<PluginEntry> {
+    pub fn get(&self, plugin_id: &str) -> Option<Arc<PluginEntry>> {
         self.by_plugin_id.get(plugin_id).map(|e| e.clone())
     }
 
@@ -424,7 +449,7 @@ impl PluginRegistry {
         self.action_requirements.remove(plugin_id);
     }
 
-    pub fn list(&self) -> Vec<PluginEntry> {
+    pub fn list(&self) -> Vec<Arc<PluginEntry>> {
         self.by_plugin_id
             .iter()
             .map(|e| e.value().clone())
@@ -435,26 +460,81 @@ impl PluginRegistry {
         self.by_conn_id.contains_key(&conn_id)
     }
 
-    pub fn get_by_conn_id(&self, conn_id: u64) -> Option<PluginEntry> {
+    pub fn get_by_conn_id(&self, conn_id: u64) -> Option<Arc<PluginEntry>> {
         let plugin_id = self.by_conn_id.get(&conn_id)?;
         self.by_plugin_id.get(plugin_id.value()).map(|e| e.clone())
     }
 
-    /// Scan registered plugins for one whose `manifest.actions` declares
-    /// `action`. Ambiguity (>1 declarer) is surfaced rather than resolved —
-    /// picking a winner would hide a deploy misconfiguration.
+    /// O(1) routing lookup (PERF-3): consult the action→provider index built
+    /// at registration instead of scanning every registered plugin. Ambiguity
+    /// (>1 declarer) is still surfaced rather than resolved — picking a winner
+    /// would hide a deploy misconfiguration.
     pub fn find_action_provider(&self, action: &str) -> ActionLookup {
-        let matches: Vec<PluginEntry> = self
-            .by_plugin_id
-            .iter()
-            .filter(|e| e.manifest.actions.iter().any(|a| a == action))
-            .map(|e| e.value().clone())
-            .collect();
+        if let Some(ids) = self.ambiguous_actions.get(action) {
+            return ActionLookup::Ambiguous(ids.clone());
+        }
+        match self.action_index.get(action) {
+            Some(provider_id) => match self.by_plugin_id.get(provider_id.as_str()) {
+                // index entry whose provider already unregistered — dangling
+                // index rows are impossible (unregister clears them), so this
+                // arm is defensive only
+                Some(entry) => ActionLookup::Found(entry.clone()),
+                None => ActionLookup::NotFound,
+            },
+            None => ActionLookup::NotFound,
+        }
+    }
 
-        match matches.len() {
-            0 => ActionLookup::NotFound,
-            1 => ActionLookup::Found(Box::new(matches.into_iter().next().unwrap())),
-            _ => ActionLookup::Ambiguous(matches.into_iter().map(|e| e.plugin_id).collect()),
+    /// PERF-3: maintain the action→provider index on registration. Unambiguous
+    /// actions land in `action_index`; a second declarer of the same action
+    /// evacuates both into `ambiguous_actions`.
+    fn index_action(&self, action: &str, plugin_id: &str) {
+        use dashmap::mapref::entry::Entry;
+
+        if let Some(mut ids) = self.ambiguous_actions.get_mut(action) {
+            if !ids.iter().any(|id| id == plugin_id) {
+                ids.push(plugin_id.to_string());
+            }
+            return;
+        }
+
+        match self.action_index.entry(action.to_string()) {
+            Entry::Occupied(occ) => {
+                if occ.get().as_str() == plugin_id {
+                    return;
+                }
+                let existing = occ.remove();
+                self.ambiguous_actions
+                    .insert(action.to_string(), vec![existing, plugin_id.to_string()]);
+            }
+            Entry::Vacant(v) => {
+                v.insert(plugin_id.to_string());
+            }
+        }
+    }
+
+    /// PERF-3: reverse of `index_action`, on unregister. Removes the plugin
+    /// from a collision set, restoring a single remaining declarer to the
+    /// unambiguous fast path.
+    fn unindex_action(&self, action: &str, plugin_id: &str) {
+        let remaining = {
+            let mut ids = self.ambiguous_actions.get_mut(action);
+            ids.as_deref_mut().and_then(|ids| {
+                ids.retain(|id| id != plugin_id);
+                (ids.len() == 1).then(|| ids[0].clone())
+            })
+        };
+        if let Some(only) = remaining {
+            self.ambiguous_actions.remove(action);
+            self.action_index.insert(action.to_string(), only);
+            return;
+        }
+        if self
+            .action_index
+            .get(action)
+            .is_some_and(|v| v.as_str() == plugin_id)
+        {
+            self.action_index.remove(action);
         }
     }
 

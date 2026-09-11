@@ -816,7 +816,9 @@ impl MessageRouter {
                 // the provider it was routed to — otherwise any registered plugin
                 // could spoof or steal another provider's response by guessing the
                 // sequential internal action_id (AUDIT: response-spoofing gap).
-                let sender_plugin_id = registry.get_by_conn_id(msg.conn_id).map(|e| e.plugin_id);
+                let sender_plugin_id = registry
+                    .get_by_conn_id(msg.conn_id)
+                    .map(|e| e.plugin_id.clone());
 
                 let status_ok = resp.status == ActionStatus::ActionOk as i32;
                 let taken = sender_plugin_id.as_ref().and_then(|plugin_id| {
@@ -909,7 +911,9 @@ impl MessageRouter {
                 // sender must be verified as the actual routed provider
                 // before we trust it (same spoofing concern as
                 // take_pending_action_if_provider).
-                let sender_plugin_id = registry.get_by_conn_id(msg.conn_id).map(|e| e.plugin_id);
+                let sender_plugin_id = registry
+                    .get_by_conn_id(msg.conn_id)
+                    .map(|e| e.plugin_id.clone());
 
                 match sender_plugin_id.and_then(|pid| {
                     registry
@@ -946,7 +950,7 @@ impl MessageRouter {
 
             Some(envelope::Payload::SessionClose(close)) => {
                 let sender_id = match registry.get_by_conn_id(msg.conn_id) {
-                    Some(entry) => entry.plugin_id,
+                    Some(entry) => entry.plugin_id.clone(),
                     None => {
                         send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
                         return true;
