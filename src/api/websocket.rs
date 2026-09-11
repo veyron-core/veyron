@@ -18,9 +18,7 @@ use tracing::{info, warn};
 use crate::auth::frame_mac::{compute_tag, verify_tag};
 use crate::auth::jwt::JwtValidator;
 use crate::ipc::connection::{Outbound, SessionKeyCell};
-use crate::ipc::framing::{
-    serialize_header, Frame, FLAG_COMPRESSED, FLAG_FRAGMENTED, FLAG_MAC_PRESENT, MAX_PAYLOAD_SIZE,
-};
+use crate::ipc::framing::{parse_frame, serialize_header, Frame, FLAG_MAC_PRESENT};
 use crate::ipc::messages::IncomingMessage;
 use crate::utils::sync::recover_poison;
 
@@ -146,7 +144,7 @@ async fn handle_socket(
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Binary(data))) => {
-                        match parse_frame(&data) {
+                        match parse_frame(&data).await {
                             Ok(frame) => {
                                 // Verify MAC on inbound frames once session key is active.
                                 let key = *session_key.lock().unwrap_or_else(recover_poison);
@@ -243,61 +241,6 @@ async fn handle_socket(
 
     info!(conn_id = conn_id, "WS client disconnected");
     let _ = disconnect_tx.send(conn_id).await;
-}
-
-pub(crate) fn parse_frame(data: &[u8]) -> Result<Frame, &'static str> {
-    if data.len() < FRAME_HEADER_SIZE {
-        return Err("frame too short");
-    }
-    let magic = u16::from_be_bytes([data[0], data[1]]);
-    if magic != 0x5652 {
-        return Err("bad magic");
-    }
-    let flags = u16::from_be_bytes([data[2], data[3]]);
-    // WS has native message framing (no fragment reassembly needed) and the
-    // gateway does not normalize compressed payloads before MAC verification —
-    // reject rather than silently mishandle. See docs/FRAMING.md.
-    if flags & FLAG_COMPRESSED != 0 {
-        return Err("compressed inbound frames not supported over WebSocket");
-    }
-    if flags & FLAG_FRAGMENTED != 0 {
-        return Err("fragmented inbound frames not supported over WebSocket");
-    }
-    let length = u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
-    if length > MAX_PAYLOAD_SIZE {
-        return Err("payload too large");
-    }
-    let payload_end = FRAME_HEADER_SIZE + length;
-    if data.len() < payload_end {
-        return Err("truncated payload");
-    }
-    let mut target = [0u8; 32];
-    target.copy_from_slice(&data[8..40]);
-    let crc32 = u32::from_be_bytes([data[40], data[41], data[42], data[43]]);
-    let payload = data[FRAME_HEADER_SIZE..payload_end].to_vec();
-    let computed = crc32fast::hash(&payload);
-    if computed != crc32 {
-        return Err("CRC mismatch");
-    }
-    let mac = if flags & FLAG_MAC_PRESENT != 0 {
-        if data.len() < payload_end + 32 {
-            return Err("frame too short for MAC tag");
-        }
-        let mut tag = [0u8; 32];
-        tag.copy_from_slice(&data[payload_end..payload_end + 32]);
-        Some(tag)
-    } else {
-        None
-    };
-    Ok(Frame {
-        magic,
-        flags,
-        length: length as u32,
-        target,
-        crc32,
-        payload: payload.into(),
-        mac,
-    })
 }
 
 pub(crate) fn frame_to_bytes(frame: &Frame) -> Vec<u8> {

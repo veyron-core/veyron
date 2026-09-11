@@ -2,17 +2,19 @@
 //! One WS connection per mirrored capability, registered on the host as
 //! `device.<cap>`. See docs/REMOTE_DEVICES_ROADMAP.md (D-06).
 
-use crate::api::websocket::{frame_to_bytes, parse_frame};
+use crate::api::websocket::frame_to_bytes;
 use crate::auth::frame_mac::{compute_tag, derive_session_key, verify_tag};
 use crate::auth::permissions::normalize_permission;
 use crate::ipc::connection::{out_frame, Outbound, SessionKeyCell};
 use crate::ipc::framing::{
-    build_frame, serialize_header, target_as_str, target_bytes, Frame, FLAG_MAC_PRESENT,
+    build_frame, parse_frame, serialize_header, target_as_str, target_bytes, Frame,
+    FLAG_MAC_PRESENT,
 };
 use crate::ipc::messages::IncomingMessage;
 use crate::plugins::registry::{DeviceMeta, PluginRegistry};
 use crate::proto::vynkor::{envelope, Envelope, PluginManifest, PluginRegister};
 use crate::utils::config::BridgeConfig;
+use crate::utils::errors::VynkorError;
 use crate::utils::sync::recover_poison;
 use axum::http::HeaderValue;
 use futures_util::{SinkExt, StreamExt};
@@ -38,7 +40,7 @@ const BRIDGE_MAX_BACKOFF: Duration = Duration::from_secs(30);
 enum BridgeError {
     Connect(String),
     Register(String),
-    Wire(&'static str),
+    Wire(VynkorError),
     Mac,
     Disconnected,
     Shutdown,
@@ -231,7 +233,7 @@ impl Bridge {
         };
         let mut payload = Vec::new();
         env.encode(&mut payload)
-            .map_err(|_| BridgeError::Wire("encode register"))?;
+            .map_err(|_| BridgeError::Wire(VynkorError::Internal("encode register".into())))?;
         let frame = build_frame("kernel", 0, payload);
         ws_write
             .send(WsMessage::Binary(frame_to_bytes(&frame)))
@@ -240,9 +242,10 @@ impl Bridge {
 
         let session_key: Option<[u8; 32]> = loop {
             let bytes = next_binary(&mut ws_read).await?;
-            let frame = parse_frame(&bytes).map_err(BridgeError::Wire)?;
-            let env = Envelope::decode(frame.payload.as_ref())
-                .map_err(|_| BridgeError::Wire("decode register ack"))?;
+            let frame = parse_frame(&bytes).await.map_err(BridgeError::Wire)?;
+            let env = Envelope::decode(frame.payload.as_ref()).map_err(|_| {
+                BridgeError::Wire(VynkorError::Internal("decode register ack".into()))
+            })?;
             match env.payload {
                 Some(envelope::Payload::PluginRegisterAck(ack)) => {
                     if !ack.accepted {
@@ -353,7 +356,11 @@ fn resolve_ws_url(host_url: &str) -> Result<String, BridgeError> {
     if host_url.starts_with("ws://") || host_url.starts_with("wss://") {
         return Ok(host_url.to_string());
     }
-    let bad = || BridgeError::Wire("host_url must start with ws://, wss://, http://, or https://");
+    let bad = || {
+        BridgeError::Wire(VynkorError::Internal(
+            "host_url must start with ws://, wss://, http://, or https://".into(),
+        ))
+    };
     let (scheme, rest) = host_url.split_once("://").ok_or_else(bad)?;
     let ws_scheme = crate::utils::url::ws_scheme_for(scheme).ok_or_else(bad)?;
     let (host, path) = match rest.split_once('/') {
@@ -423,7 +430,7 @@ async fn read_loop(
             Ok(_) => continue,
             Err(e) => return Err(BridgeError::Connect(e.to_string())),
         };
-        let mut frame = parse_frame(&bytes).map_err(BridgeError::Wire)?;
+        let mut frame = parse_frame(&bytes).await.map_err(BridgeError::Wire)?;
         if let Some(k) = &key {
             let tag_present = frame.flags & FLAG_MAC_PRESENT != 0 && frame.mac.is_some();
             let valid = tag_present
@@ -631,7 +638,7 @@ mod tests {
                 WsMessage::Binary(b) => b,
                 other => panic!("expected binary register, got {other:?}"),
             };
-            let frame = parse_frame(&bytes).unwrap();
+            let frame = parse_frame(&bytes).await.unwrap();
             let env = Envelope::decode(frame.payload.as_ref()).unwrap();
             let reg = match env.payload {
                 Some(envelope::Payload::PluginRegister(r)) => r,
@@ -704,7 +711,7 @@ mod tests {
                 WsMessage::Binary(b) => b,
                 other => panic!("expected binary outbound, got {other:?}"),
             };
-            let out_frame = parse_frame(&bytes).unwrap();
+            let out_frame = parse_frame(&bytes).await.unwrap();
             assert_eq!(frame_target(&out_frame), "kernel");
             assert!(out_frame.flags & FLAG_MAC_PRESENT != 0);
             let tag = out_frame.mac.expect("outbound frame must be MAC'd");

@@ -81,6 +81,29 @@ where
         .map_err(Into::into)
 }
 
+/// Parse one full wire frame from an in-memory buffer — the WebSocket gateway
+/// and `role: client` bridge deliver a complete binary message per frame, so a
+/// whole frame's bytes are already at hand (no incremental stream read).
+///
+/// This is the kernel's single frame parser: it delegates to
+/// `vynkor_wire::framing::read_frame`, so `FLAG_COMPRESSED` is decompressed
+/// and normalized exactly as on the UDS read path (payload is plaintext, and
+/// flags/length/crc32 describe the plaintext). `FLAG_FRAGMENTED` is rejected —
+/// neither the gateway nor the bridge has a reassembly layer (WebSocket already
+/// frames messages), so a fragment would reach the router half-parsed.
+pub async fn parse_frame(data: &[u8]) -> Result<Frame, VynkorError> {
+    let mut slice = data;
+    let frame = vynkor_wire::framing::read_frame(&mut slice)
+        .await
+        .map_err(VynkorError::from)?;
+    if frame.flags & FLAG_FRAGMENTED != 0 {
+        return Err(VynkorError::Internal(
+            "fragmented inbound frames not supported over WebSocket".to_string(),
+        ));
+    }
+    Ok(frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
