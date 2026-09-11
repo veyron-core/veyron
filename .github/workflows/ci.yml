@@ -14,12 +14,12 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # SDKs/wire live in sibling repos (not submodules — temporary decision,
       # see ROADMAP). Clone them beside the workspace so tests and the
       # proto drift check can reach their sources via ../vynkor-* paths.
-      # Plain git clone: actions/checkout@v4 refuses `path: ../` (repo path
+      # Plain git clone: actions/checkout@v7 refuses `path: ../` (repo path
       # must stay under the workspace) since runner 2.319+.
       - name: Clone vynkor-wire (sibling)
         run: git clone --depth 1 https://github.com/vynkor-core/vynkor-wire.git ../vynkor-wire
