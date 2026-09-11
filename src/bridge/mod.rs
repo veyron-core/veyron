@@ -1,10 +1,12 @@
-//! D-06: `role: client` — mirror local plugins on a remote host kernel.
-//! One WS connection per mirrored capability, registered on the host as
-//! `device.<cap>`. See docs/REMOTE_DEVICES_ROADMAP.md (D-06).
+//! D-06: `role: client` — pure WS transport to a remote host kernel.
+//! One WS connection per device; the client kernel registers as itself
+//! (`device_id`) with its configured capabilities in a single mux register,
+//! then relays frames bidirectionally. No capability interpretation — the
+//! bridge passes bytes; the local router resolves targets. See
+//! docs/REMOTE_DEVICES_ROADMAP.md (D-06) and docs/DUMB_CORE_AUDIT.md (F3).
 
 use crate::api::websocket::frame_to_bytes;
 use crate::auth::frame_mac::{compute_tag, derive_session_key, verify_tag};
-use crate::auth::permissions::normalize_permission;
 use crate::ipc::connection::{out_frame, Outbound, SessionKeyCell};
 use crate::ipc::framing::{
     build_frame, parse_frame, serialize_header, target_as_str, target_bytes, Frame,
@@ -73,9 +75,8 @@ impl BridgeHandle {
         Self::default()
     }
 
-    /// Best-effort relay of an unroutable local frame. v1: sends via the
-    /// first live connection — the host sees the frame's sender as whichever
-    /// capability owns that connection.
+    /// Best-effort relay of an unroutable local frame: sends via the live
+    /// device connection — the host resolves the frame's target on its side.
     pub fn relay_to_host(&self, frame: &Frame) -> bool {
         let conns = self.conns.lock().unwrap_or_else(recover_poison);
         let Some(tx) = conns.first() else {
@@ -147,55 +148,29 @@ impl Bridge {
         }
     }
 
-    /// One mirror task per mirrored capability; the task set outlives every
-    /// individual connection (reconnect with backoff).
+    /// One connection task for the whole device; it outlives every individual
+    /// connection (reconnect with backoff).
     pub async fn run(self) {
-        let mut tasks = Vec::new();
-        for (idx, cap) in self.config.mirror.iter().enumerate() {
-            let bridge = self.clone();
-            let cap = cap.clone();
-            tasks.push(tokio::spawn(bridge.mirror_cap(cap, idx)));
-        }
-        for task in tasks {
-            let _ = task.await;
-        }
-    }
-
-    async fn mirror_cap(self, cap: String, idx: usize) {
-        let conn_id = BRIDGE_CONN_ID_BASE + idx as u64;
         let mut backoff = Duration::from_secs(1);
         loop {
-            match self.one_cycle(&cap, conn_id).await {
-                Ok(()) => info!(cap = %cap, "bridge connection closed"),
+            match self.one_cycle().await {
+                Ok(()) => info!("bridge connection closed"),
                 Err(BridgeError::Shutdown) => return,
-                Err(e) => warn!(cap = %cap, error = %e, "bridge connection failed"),
+                Err(e) => warn!(error = %e, "bridge connection failed"),
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(BRIDGE_MAX_BACKOFF);
         }
     }
 
-    async fn one_cycle(&self, cap: &str, conn_id: u64) -> Result<(), BridgeError> {
-        // mirror only a live local plugin: the manifest is registered on the
-        // host verbatim (so its actions resolve there) and locally stripped
-        // of the provider surface (so <device_id>.<cap> never wins action lookup)
-        let (host_manifest, local_user_id) = wait_for_local_plugin(&self.registry, cap).await;
+    async fn one_cycle(&self) -> Result<(), BridgeError> {
         let url = resolve_ws_url(&self.config.host_url)?;
-        self.run_conn(cap, conn_id, &url, host_manifest, local_user_id)
-            .await
+        self.run_conn(&url).await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn run_conn(
-        &self,
-        cap: &str,
-        conn_id: u64,
-        url: &str,
-        host_manifest: PluginManifest,
-        local_user_id: String,
-    ) -> Result<(), BridgeError> {
-        // <device_id>.<cap> — D-14 naming decision, globally unique per device
-        let device_plugin_id = format!("{}.{}", self.device_id, cap);
+    async fn run_conn(&self, url: &str) -> Result<(), BridgeError> {
+        let conn_id = BRIDGE_CONN_ID_BASE;
+        let caps = self.config.mirror.clone();
 
         let mut req = url
             .into_client_request()
@@ -216,15 +191,23 @@ impl Bridge {
             .map_err(|e| BridgeError::Connect(e.to_string()))?;
         let (mut ws_write, mut ws_read) = ws.split();
 
-        // register on the host, unauthenticated at the frame level (MAC arms
-        // only after the ack) — mirrors the SDK register_full flow
+        // register the device itself, unauthenticated at the frame level (MAC
+        // arms only after the ack) — mirrors the SDK register_full flow. One
+        // mux register: plugin_id = device_id, every capability at once.
+        let manifest = PluginManifest {
+            permissions: vec![
+                "PERMISSION_IPC_SEND".to_string(),
+                "PERMISSION_EVENT_PUBLISH".to_string(),
+            ],
+            ..Default::default()
+        };
         let reg = PluginRegister {
-            plugin_id: device_plugin_id.clone(),
+            plugin_id: self.device_id.clone(),
             version: "1.0.0".to_string(),
-            manifest: Some(host_manifest.clone()),
+            manifest: Some(manifest),
             jwt_token: token,
             device_id: self.device_id.clone(),
-            capabilities: vec![cap.to_string()],
+            capabilities: caps.clone(),
             ..Default::default()
         };
         let env = Envelope {
@@ -255,11 +238,11 @@ impl Bridge {
                         Some(secret) if !ack.session_nonce.is_empty() => Some(derive_session_key(
                             secret.as_bytes(),
                             &ack.session_nonce,
-                            &device_plugin_id,
+                            &self.device_id,
                         )),
                         _ => None,
                     };
-                    info!(plugin_id = %device_plugin_id, "registered on host");
+                    info!(plugin_id = %self.device_id, "device registered on host");
                     break key;
                 }
                 Some(envelope::Payload::Error(err)) => {
@@ -269,25 +252,31 @@ impl Bridge {
                     )))
                 }
                 _ => {
-                    warn!(cap = %cap, "unexpected frame before registration ack");
+                    warn!("unexpected frame before registration ack");
                     continue;
                 }
             }
         };
 
-        // local registration makes the router resolve <device_id>.<cap> without
-        // round-tripping the host — local-to-local traffic stays local
+        // one local entry for the device; the router resolves the bare cap
+        // names and falls through to this handle for host-bound frames. The
+        // entry carries no action surface — it is a routing proxy, never a
+        // provider — so host-bound actions never loop back to the host.
         let (host_tx, host_rx) = mpsc::channel::<Outbound>(64);
-        let local_manifest = local_entry_manifest(&host_manifest, cap);
+        let local_manifest = PluginManifest {
+            ipc_targets: caps.clone(),
+            permissions: vec!["PERMISSION_IPC_SEND".to_string()],
+            ..Default::default()
+        };
         let meta = DeviceMeta {
             device_id: self.device_id.clone(),
-            user_id: local_user_id,
-            capabilities: vec![cap.to_string()],
+            user_id: "default".to_string(),
+            capabilities: caps.clone(),
             ..Default::default()
         };
         self.registry
             .register_with_device(
-                device_plugin_id.clone(),
+                self.device_id.clone(),
                 conn_id,
                 local_manifest,
                 host_tx.clone(),
@@ -305,7 +294,7 @@ impl Bridge {
         let result = read_loop(
             &mut ws_read,
             conn_id,
-            cap,
+            &self.device_id,
             session_key,
             host_tx.clone(),
             self.router_tx.clone(),
@@ -313,41 +302,11 @@ impl Bridge {
         )
         .await;
 
-        self.registry.unregister(&device_plugin_id);
+        self.registry.unregister(&self.device_id);
         self.handle.unregister_conn(&host_tx);
         write_task.abort();
         result
     }
-}
-
-/// Poll until the local plugin registers, then take its manifest + user id.
-async fn wait_for_local_plugin(registry: &PluginRegistry, cap: &str) -> (PluginManifest, String) {
-    loop {
-        if let Some(entry) = registry.get(cap) {
-            return (entry.manifest.clone(), entry.user_id.clone());
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
-/// The local registry entry is a routing proxy, not a provider: strip the
-/// action/event surface so find_action_provider/event delivery never resolve
-/// <device_id>.<cap>, and force the send gate so host->client frames pass
-/// forward()'s permission checks.
-fn local_entry_manifest(host_manifest: &PluginManifest, cap: &str) -> PluginManifest {
-    let mut m = host_manifest.clone();
-    m.actions = Vec::new();
-    m.action_specs = Vec::new();
-    m.events = Vec::new();
-    m.ipc_targets = vec![cap.to_string()];
-    if !m
-        .permissions
-        .iter()
-        .any(|p| normalize_permission(p) == "ipc_send")
-    {
-        m.permissions.push("PERMISSION_IPC_SEND".to_string());
-    }
-    m
 }
 
 /// http(s):// base URLs get their scheme swapped and default to the /ws
@@ -417,7 +376,7 @@ async fn write_loop(
 async fn read_loop(
     ws_read: &mut futures_util::stream::SplitStream<WsStream>,
     conn_id: u64,
-    cap: &str,
+    device_id: &str,
     key: Option<[u8; 32]>,
     host_tx: mpsc::Sender<Outbound>,
     router_tx: mpsc::Sender<IncomingMessage>,
@@ -449,13 +408,15 @@ async fn read_loop(
         // out — strip the host's tag here
         frame.flags &= !FLAG_MAC_PRESENT;
         frame.mac = None;
-        // host kernel-generated frames carry target "client"; route them to
-        // the local kernel or the mirrored plugin, never to "client"
-        frame.target = target_bytes(if is_kernel_routed(&frame) {
-            "kernel"
+        // kernel-generated frames go to the local kernel; device traffic is
+        // addressed by the host's fully-qualified name (<device_id>.<cap>) and
+        // must be stripped to the bare cap so the local router finds the plugin
+        let local_target = if is_kernel_routed(&frame) {
+            "kernel".to_string()
         } else {
-            cap
-        });
+            strip_device_prefix(&frame, device_id)
+        };
+        frame.target = target_bytes(&local_target);
         let msg = IncomingMessage {
             conn_id,
             frame,
@@ -467,6 +428,18 @@ async fn read_loop(
         }
     }
     Err(BridgeError::Disconnected)
+}
+
+/// host->client device frames carry `<device_id>.<cap>`; the local kernel
+/// addresses the same plugin by its bare cap name. Strip the prefix. Any other
+/// target (bare device id, "client") is not device traffic — hand it to the
+/// kernel.
+fn strip_device_prefix(frame: &Frame, device_id: &str) -> String {
+    let prefix = format!("{device_id}.");
+    target_as_str(frame)
+        .and_then(|t| t.strip_prefix(&prefix))
+        .unwrap_or("kernel")
+        .to_string()
 }
 
 /// Payloads the host's kernel arms handle (mirrors the local router's
@@ -505,15 +478,6 @@ mod tests {
         target_as_str(frame).unwrap_or_default().to_string()
     }
 
-    fn manifest_with(actions: &[&str]) -> PluginManifest {
-        PluginManifest {
-            actions: actions.iter().map(|s| s.to_string()).collect(),
-            permissions: vec!["PERMISSION_IPC_SEND".to_string()],
-            ipc_targets: vec!["device-1.geo".to_string()],
-            ..Default::default()
-        }
-    }
-
     fn plain_frame(target: &str, env: &Envelope) -> Frame {
         let mut payload = Vec::new();
         env.encode(&mut payload).unwrap();
@@ -537,13 +501,20 @@ mod tests {
     }
 
     #[test]
-    fn local_manifest_strips_provider_surface_and_forces_send_gate() {
-        let m = local_entry_manifest(&manifest_with(&["get_position"]), "geo");
-        assert!(m.actions.is_empty(), "actions must not resolve locally");
-        assert!(m.action_specs.is_empty());
-        assert!(m.events.is_empty());
-        assert_eq!(m.ipc_targets, vec!["geo".to_string()]);
-        assert!(m.permissions.iter().any(|p| p == "PERMISSION_IPC_SEND"));
+    fn strip_device_prefix_maps_caps_and_kernel_frames() {
+        let env = Envelope::default();
+        assert_eq!(
+            strip_device_prefix(&plain_frame("device-1.geo", &env), "device-1"),
+            "geo"
+        );
+        assert_eq!(
+            strip_device_prefix(&plain_frame("device-1", &env), "device-1"),
+            "kernel"
+        );
+        assert_eq!(
+            strip_device_prefix(&plain_frame("client", &env), "device-1"),
+            "kernel"
+        );
     }
 
     #[test]
@@ -580,19 +551,6 @@ mod tests {
         let registry = Arc::new(PluginRegistry::new());
         let (router_tx, mut router_rx) = mpsc::channel::<IncomingMessage>(64);
         let handle = BridgeHandle::new();
-
-        // the local plugin is already registered (its manifest goes to the host)
-        let (cap_tx, _cap_rx) = mpsc::channel::<Outbound>(8);
-        registry
-            .register(
-                "geo".to_string(),
-                1,
-                manifest_with(&["get_position"]),
-                cap_tx,
-                "local",
-                "default",
-            )
-            .unwrap();
 
         let bridge = Bridge::new(
             BridgeConfig {
@@ -644,7 +602,7 @@ mod tests {
                 Some(envelope::Payload::PluginRegister(r)) => r,
                 other => panic!("expected PluginRegister, got {other:?}"),
             };
-            assert_eq!(reg.plugin_id, "device-1.geo");
+            assert_eq!(reg.plugin_id, "device-1");
             assert_eq!(reg.capabilities, vec!["geo"]);
             assert_eq!(reg.device_id, "device-1");
 
@@ -663,7 +621,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            let key = derive_session_key(&host_secret, b"nonce-aaaaaaaaaa", "device-1.geo");
+            let key = derive_session_key(&host_secret, b"nonce-aaaaaaaaaa", "device-1");
 
             // host kernel -> device: an Event (device traffic)
             let event = Envelope {
@@ -675,7 +633,7 @@ mod tests {
                 })),
                 ..Default::default()
             };
-            let mut event_frame = plain_frame("client", &event);
+            let mut event_frame = plain_frame("device-1.geo", &event);
             event_frame.flags |= FLAG_MAC_PRESENT;
             let header = serialize_header(&event_frame);
             event_frame.mac = Some(compute_tag(&key, &header, &event_frame.payload));
@@ -742,12 +700,14 @@ mod tests {
             .unwrap();
         assert_eq!(frame_target(&msg.frame), "kernel");
 
-        // the local registry now resolves device-1.geo to the bridge
-        let entry = registry
-            .get("device-1.geo")
-            .expect("bridge entry registered");
-        assert_eq!(entry.plugin_id, "device-1.geo");
+        // the local registry now resolves the device (and its caps) to the bridge
+        let entry = registry.get("device-1").expect("bridge entry registered");
+        assert_eq!(entry.plugin_id, "device-1");
         assert!(entry.manifest.actions.is_empty());
+        assert!(
+            registry.get_mux("device-1.geo").is_some(),
+            "device cap must resolve to the mux device entry"
+        );
 
         // push a kernel-reply frame through the bridge entry's write channel
         // (what the local ActionResponse arm does after resolving a pending)
