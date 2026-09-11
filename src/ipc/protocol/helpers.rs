@@ -151,6 +151,20 @@ pub(crate) fn send_error(
     send_envelope(tx, env);
 }
 
+// stable wire message, not the Debug variant name — plugins must not see
+// kernel-internal enum names; full detail stays in operator logs
+pub(crate) fn action_status_message(status: ActionStatus) -> &'static str {
+    match status {
+        ActionStatus::ActionNotFound => "action not found",
+        ActionStatus::ActionPermissionDeny => "permission denied",
+        ActionStatus::ActionTimeout => "action timed out",
+        ActionStatus::ActionQuotaExceeded => "quota exceeded",
+        ActionStatus::ActionStreamBackpressure => "stream backpressure",
+        ActionStatus::ActionError => "action failed",
+        ActionStatus::ActionOk | ActionStatus::ActionUnknown => "unknown action status",
+    }
+}
+
 pub(crate) fn send_register_reject(tx: &mpsc::Sender<Outbound>, reason: &str) {
     let ack = crate::proto::vynkor::PluginRegisterAck {
         accepted: false,

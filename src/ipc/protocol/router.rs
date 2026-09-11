@@ -28,8 +28,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::helpers::{
-    abort_stream, envelope_message_id, is_throttle_exempt, send_envelope, send_error,
-    send_register_reject, try_send_envelope, ACTION_CORRELATION_SEQ, EVENT_PUBLISH_SEQ,
+    abort_stream, action_status_message, envelope_message_id, is_throttle_exempt, send_envelope,
+    send_error, send_register_reject, try_send_envelope, ACTION_CORRELATION_SEQ, EVENT_PUBLISH_SEQ,
 };
 use crate::ipc::connection::out_frame;
 use crate::ipc::framing::target_as_str;
@@ -387,7 +387,8 @@ impl MessageRouter {
                             manifest.ipc_targets = claims.ipc_targets;
                         }
                         Err(e) => {
-                            send_register_reject(&msg.write_tx, &format!("auth failed: {e}"));
+                            warn!(plugin_id = %plugin_id, error = %e, "registration authentication failed");
+                            send_register_reject(&msg.write_tx, "authentication failed");
                             return true;
                         }
                     }
@@ -404,12 +405,10 @@ impl MessageRouter {
                         match store.active_secret(&reg.device_id) {
                             Ok(Some(secret)) => device_secret = Some(secret.into_bytes()),
                             Ok(None) => {
+                                warn!(device_id = %reg.device_id, "registration rejected: unknown device");
                                 send_register_reject(
                                     &msg.write_tx,
-                                    &format!(
-                                        "unknown device '{}' — pair it via `vyn device connect`",
-                                        reg.device_id
-                                    ),
+                                    "unknown device — pair it first",
                                 );
                                 return true;
                             }
@@ -795,7 +794,7 @@ impl MessageRouter {
                             action_id,
                             status: status as i32,
                             data_json: vec![],
-                            error: format!("{:?}", status),
+                            error: action_status_message(status).to_string(),
                         })),
                         ..Default::default()
                     };
