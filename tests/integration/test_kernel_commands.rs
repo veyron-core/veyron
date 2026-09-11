@@ -373,13 +373,95 @@ async fn kernel_routes_action_to_declared_provider_and_correlates_response() {
 }
 
 #[tokio::test]
-async fn kernel_denies_action_when_provider_lacks_required_permission() {
+async fn kernel_allows_action_without_v2_action_requirement() {
+    // F5: without a v2 action_requirement in the manifest, there is no
+    // permission gate. The provider declaring the action is authorization
+    // enough (R5-07).
     let (shutdown_tx, _registry, _bus) =
-        start_kernel("/tmp/vynkor_integ_action_perm_deny.sock", 19218).await;
+        start_kernel("/tmp/vynkor_integ_action_no_req.sock", 19218).await;
 
-    // Provider declares the action but not the permission it requires
-    // (http_request -> PERMISSION_NETWORK, see auth::permissions::required_permission_for_action).
-    let mut provider = VynkorClient::connect("/tmp/vynkor_integ_action_perm_deny.sock")
+    let mut provider = VynkorClient::connect("/tmp/vynkor_integ_action_no_req.sock")
+        .await
+        .unwrap();
+    provider
+        .register(
+            "network-plugin",
+            PluginManifest {
+                actions: vec!["http_request".to_string()],
+                permissions: vec!["PERMISSION_NETWORK".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut requester = VynkorClient::connect("/tmp/vynkor_integ_action_no_req.sock")
+        .await
+        .unwrap();
+    requester
+        .register("action-requester", PluginManifest::default())
+        .await
+        .unwrap();
+
+    let request_fut = tokio::spawn(async move {
+        requester
+            .send_action("http_request", br#"{"url":"http://example.com"}"#, 2000)
+            .await
+    });
+
+    // Provider receives the action and responds
+    let received = timeout(Duration::from_secs(2), provider.recv())
+        .await
+        .expect("provider recv timed out")
+        .expect("provider recv failed");
+    let internal_action_id = match received.payload {
+        Some(vynkor::proto::vynkor::envelope::Payload::ActionRequest(req)) => {
+            assert_eq!(req.action, "http_request");
+            req.action_id
+        }
+        other => panic!("expected ActionRequest, got {other:?}"),
+    };
+
+    let resp_env = vynkor::proto::vynkor::Envelope {
+        payload: Some(vynkor::proto::vynkor::envelope::Payload::ActionResponse(
+            vynkor::proto::vynkor::ActionResponse {
+                action_id: internal_action_id,
+                status: ActionStatus::ActionOk as i32,
+                data_json: br#"{"status":"ok"}"#.to_vec(),
+                error: String::new(),
+            },
+        )),
+        ..Default::default()
+    };
+    provider.send("kernel", resp_env).await.unwrap();
+
+    let resp = timeout(Duration::from_secs(2), request_fut)
+        .await
+        .expect("timed out")
+        .expect("task panicked")
+        .expect("send_action failed");
+
+    assert_eq!(
+        resp.status,
+        ActionStatus::ActionOk as i32,
+        "action without v2 action_requirement should be allowed"
+    );
+
+    let _ = shutdown_tx.send(());
+}
+
+#[tokio::test]
+async fn kernel_enforces_v2_action_requirement_on_both_sides() {
+    // F5 + T-19: v2 action_requirement gates BOTH provider and requester.
+    // Provider declares http_request with action_requirement PERMISSION_NETWORK
+    // but doesn't hold the permission → denied.
+    use std::collections::HashMap;
+    use vynkor::proto::vynkor::PermissionType;
+
+    let (shutdown_tx, registry, _bus) =
+        start_kernel("/tmp/vynkor_integ_action_v2_deny.sock", 19219).await;
+
+    let mut provider = VynkorClient::connect("/tmp/vynkor_integ_action_v2_deny.sock")
         .await
         .unwrap();
     provider
@@ -387,13 +469,23 @@ async fn kernel_denies_action_when_provider_lacks_required_permission() {
             "network-imposter",
             PluginManifest {
                 actions: vec!["http_request".to_string()],
+                // No PERMISSION_NETWORK — the v2 requirement will deny
                 ..Default::default()
             },
         )
         .await
         .unwrap();
 
-    let mut requester = VynkorClient::connect("/tmp/vynkor_integ_action_perm_deny.sock")
+    // Set v2 action_requirement: http_request requires PERMISSION_NETWORK
+    registry.set_action_requirements(
+        "network-imposter".to_string(),
+        HashMap::from([(
+            "http_request".to_string(),
+            PermissionType::PermissionNetwork,
+        )]),
+    );
+
+    let mut requester = VynkorClient::connect("/tmp/vynkor_integ_action_v2_deny.sock")
         .await
         .unwrap();
     requester
@@ -412,69 +504,13 @@ async fn kernel_denies_action_when_provider_lacks_required_permission() {
     assert_eq!(
         resp.status,
         ActionStatus::ActionPermissionDeny as i32,
-        "provider without PERMISSION_NETWORK must not receive http_request"
+        "provider without PERMISSION_NETWORK must not receive http_request when v2 action_requirement is set"
     );
 
-    // The provider must never have been forwarded the request.
     let never_received = timeout(Duration::from_millis(300), provider.recv()).await;
     assert!(
         never_received.is_err(),
         "provider without required permission must not receive the ActionRequest"
-    );
-
-    let _ = shutdown_tx.send(());
-}
-
-#[tokio::test]
-async fn kernel_denies_action_when_requester_lacks_required_permission() {
-    // T-19: even when the provider legitimately holds PERMISSION_NETWORK, an
-    // unprivileged requester must not be able to launder a network request
-    // through it by calling the declared action directly.
-    let (shutdown_tx, _registry, _bus) =
-        start_kernel("/tmp/vynkor_integ_action_perm_deny_requester.sock", 19219).await;
-
-    let mut provider = VynkorClient::connect("/tmp/vynkor_integ_action_perm_deny_requester.sock")
-        .await
-        .unwrap();
-    provider
-        .register(
-            "network-provider",
-            PluginManifest {
-                actions: vec!["http_request".to_string()],
-                permissions: vec!["PERMISSION_NETWORK".to_string()],
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-
-    let mut requester = VynkorClient::connect("/tmp/vynkor_integ_action_perm_deny_requester.sock")
-        .await
-        .unwrap();
-    requester
-        .register("unprivileged-requester", PluginManifest::default())
-        .await
-        .unwrap();
-
-    let resp = timeout(
-        Duration::from_secs(2),
-        requester.send_action("http_request", br#"{"url":"http://example.com"}"#, 2000),
-    )
-    .await
-    .expect("timed out")
-    .expect("send_action failed");
-
-    assert_eq!(
-        resp.status,
-        ActionStatus::ActionPermissionDeny as i32,
-        "requester without PERMISSION_NETWORK must not be able to invoke http_request \
-         even via a provider that legitimately holds the permission"
-    );
-
-    let never_received = timeout(Duration::from_millis(300), provider.recv()).await;
-    assert!(
-        never_received.is_err(),
-        "provider must never receive the ActionRequest when the requester lacks the permission"
     );
 
     let _ = shutdown_tx.send(());

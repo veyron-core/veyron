@@ -377,7 +377,7 @@ backlog (polish).
 
 ### P2 — this cycle
 
-- [ ] UX-1 — **REST errors are bare `StatusCode` with no body/envelope
+- [x] UX-1 — **REST errors are bare `StatusCode` with no body/envelope
       (Medium):** 422 collapses distinct causes (invalid manifest vs spawn
       failure); `stop_plugin` returns 200 even when the stop failed
       (`routes.rs:115`); 429 is the only error with a body + `Retry-After`;
@@ -386,15 +386,15 @@ backlog (polish).
   - Files: `src/api/routes.rs`, `src/api/middleware.rs`, `src/api/rate_limit.rs`.
   - Acceptance: a JSON error envelope (code/message/retryable) on all
     non-2xx; `stop_plugin` reports failure; endpoint doc (OpenAPI or README).
-  - **Status (2026-08-14): OPEN.**
+  - **Status (2026-09-11): SHIPPED (PR #85).**
 
-- [ ] S5 — **Internals leak into plugin-facing errors (Low):** registration
+- [x] S5 — **Internals leak into plugin-facing errors (Low):** registration
       reject sends raw jsonwebtoken detail (`auth failed: {e}`,
       `protocol.rs:322`); `ActionResponse.error` is a Debug enum name
       (`format!("{:?}", status)`, `protocol.rs:654`).
   - Files: `src/ipc/protocol.rs`.
   - Acceptance: stable, documented error codes/messages on the wire.
-  - **Status (2026-08-14): OPEN.**
+  - **Status (2026-09-11): SHIPPED (PR #87).**
 
 - [x] UX-2 — **Debug repr leaks into public API shapes (Low-Med):**
       `PluginInfo.state = format!("{:?}", e.state)` (`routes.rs:59`) — a Rust
@@ -407,7 +407,7 @@ backlog (polish).
     and the kernel `list_plugins` command (same leak class). Locked by
     assertions in test_api/test_registry/kernel commands tests.
 
-- [ ] PERF-3 — **Per-message full `PluginEntry` clones + O(n) registry scans
+- [x] PERF-3 — **Per-message full `PluginEntry` clones + O(n) registry scans
       (Low-Med):** `registry.get` clones the whole entry incl. the manifest
       proto (`registry.rs:159`; ~4 per forwarded message via `get_by_conn_id`
       + `check_ipc_send` + `check_ipc_target` + `get`); `find_action_provider`
@@ -417,27 +417,20 @@ backlog (polish).
   - Files: `src/plugins/registry.rs`, `src/auth/permissions.rs`.
   - Acceptance: `Arc<PluginEntry>` or split hot/cold fields; action→provider
     index; no O(n) scan per message.
-  - **Status (2026-08-14): OPEN.**
+  - **Status (2026-09-11): SHIPPED (PR #86).**
 
 ### P3 — backlog
 
-- [ ] PERF-4 — **Hot-path constant-factor costs (Low):** double CRC32 per
+- [x] PERF-4 — **Hot-path constant-factor costs (Low):** double CRC32 per
       outbound frame (build site + `write_frame_raw`); synchronous zstd
       compress/decompress on async threads (`wire/src/framing.rs:137-152,240`);
       sync `/proc` reads in the watchdog loop (`supervisor.rs:852,864`); WS
       double payload copy per frame (`websocket.rs:220,246-258`).
   - Files: `../vynkor-wire/src/framing.rs`, `src/plugins/supervisor.rs`,
     `src/api/websocket.rs`.
-  - **Status (2026-08-26): PARTIAL** — watchdog `/proc` sweep now runs in one
-    `spawn_blocking` batch instead of stalling the shared async task per pid,
-    and the watchdog ping uses `try_send` (same shared-task rationale as
-    PERF-1; `watchdog_pings_dropped_total`). WS "double payload copy" closed
-    as non-issue: since wire 0.2.0 `Frame.payload` is `Arc<[u8]>`, so the
-    inbound `to_vec()`→`Arc` hop and the outbound single
-    `extend_from_slice` into the WS binary message are already one copy each.
-    Remaining (wire-crate release cycle): dedup the CRC32 between kernel
-    build sites and `write_frame_raw`, offload zstd off async threads — both
-    live in `vynkor-wire/src/framing.rs` and need a published bump.
+  - **Status (2026-09-11): SHIPPED.** CRC dedup in `write_frame_raw` (wire
+    0.0.4): skip recompression when payload unchanged. Watchdog `/proc` and
+    WS copy already closed (PR #68). zstd offload deferred (user decision).
 
 - [x] UX-3 — **Config validation gaps + silent parse-error swallowing (Low):**
       unknown `restart:` silently → `on-failure` (`loader.rs:19-23`) while
@@ -494,7 +487,7 @@ the audit's §E: **P0** before next release (monoliths + error-system unificatio
 
 ### P0 — before next release
 
-- [ ] MA-01 — **Split `ipc/protocol.rs` (1389 LOC) and
+- [x] MA-01 — **Split `ipc/protocol.rs` (1389 LOC) and
       `marketplace/registry.rs` (1509 LOC):** two files exceed the 250-LOC
       guideline 5–6×; `protocol.rs` bundles the router + 12 handlers
       (PluginRegister, ActionRequest, SessionClose, KernelCommand…);
@@ -505,6 +498,7 @@ the audit's §E: **P0** before next release (monoliths + error-system unificatio
     `ipc/handlers/{register,action,session,event,kernel}.rs`; `registry.rs`
     split into `marketplace/registry/{cache,fetch,verify,parse}.rs` (or
     `#[cfg(test)] mod tests` moved out). Full suite + clippy + fmt green.
+  - **Status (2026-09-11): SHIPPED (PR #82).**
 
 - [x] MA-02 — **Extract duplicated frame/URL helpers:** `target_bytes` /
       `frame_target` / `build_frame` copied in 5 sites
@@ -556,7 +550,7 @@ the audit's §E: **P0** before next release (monoliths + error-system unificatio
 
 ### P1 — hygiene
 
-- [ ] MA-05 — **Add `docs/COMMENT_TAGS.md` and reduce comment duplication:**
+- [x] MA-05 — **Add `docs/COMMENT_TAGS.md` and reduce comment duplication:**
       audit tags (`T-11`, `S1`, `BUG-006`, `R9-02`…) are opaque without a
       glossary; the socket-0o600 rationale is duplicated 4×
       (`config.rs:272`, `ipc/server.rs:52`, `main.rs:479`, `utils/tls.rs:50`);
@@ -571,6 +565,7 @@ the audit's §E: **P0** before next release (monoliths + error-system unificatio
     in-code comments cross-reference it; `//` inline comments follow one
     convention (lowercase, no trailing period per `CLAUDE.md`); trivial
     restatements removed.
+  - **Status (2026-09-11): SHIPPED (PR #89).**
 
 - [x] MA-06 — **Replace `create_router_full(10 args)` with a config struct:**
       `api/server.rs`'s constructor is clippy-suppressed (`too_many_arguments`);
@@ -615,19 +610,21 @@ the audit's §E: **P0** before next release (monoliths + error-system unificatio
     ipc::protocol::reset_for_test()` zeroes all three; locked in by
     `reset_for_test_zeroes_all_sequence_atomics`.
 
-- [ ] MA-09 — **Split `plugins/supervisor.rs` (933 LOC):** `spawn_internal`
+- [x] MA-09 — **Split `plugins/supervisor.rs` (933 LOC):** `spawn_internal`
       is 200 LOC + `monitor_loop` + `watchdog_loop` + `graceful_shutdown` in
       one file.
   - Files: `src/plugins/supervisor.rs`.
   - Acceptance: split into `supervisor/spawn.rs`, `supervisor/watchdog.rs`
     (or equivalent); full suite green.
+  - **Status (2026-09-11): SHIPPED (PR #83).**
 
-- [ ] MA-10 — **Split `kernel/orchestrator.rs` (470 LOC):** bundles TLS
+- [x] MA-10 — **Split `kernel/orchestrator.rs` (470 LOC):** bundles TLS
       resolve + `bind_ip` logic + bridge spawn + supervisor + watchdog +
       `disconnect_loop` ×2 + `graceful_shutdown`.
   - Files: `src/kernel/orchestrator.rs`.
   - Acceptance: split into `orchestrator/bind.rs`, `orchestrator/shutdown.rs`
     (or equivalent).
+  - **Status (2026-09-11): SHIPPED (PR #84).**
 
 ### P2 — polish
 
@@ -650,13 +647,14 @@ the audit's §E: **P0** before next release (monoliths + error-system unificatio
     `events/store.rs`, `api/websocket.rs`, `ipc/connection.rs`,
     `ipc/server.rs`, `bridge/mod.rs` now pass it to `unwrap_or_else`.
 
-- [ ] MA-13 — **Reuse `vynkor_wire` framing in the WebSocket gateway:**
+- [x] MA-13 — **Reuse `vynkor_wire` framing in the WebSocket gateway:**
       `api/websocket.rs:229` has a custom `parse_frame` without
       `COMPRESSED`/`FRAGMENTED` support — any framing fix must be applied in
       two places.
   - Files: `src/api/websocket.rs`.
   - Acceptance: WS gateway reuses `vynkor_wire::framing::read_frame` (or the
     WS-specific framing moves into `vynkor_wire`); no duplicated frame parser.
+  - **Status (2026-09-11): SHIPPED (PR #88).**
 
 - [x] MA-14 — **Reduce `utils/logging.rs` duplication + use `try_init()`:**
       4 `if json { with otel } else` branches duplicate 80% of `fmt::layer()`;
@@ -775,7 +773,7 @@ rest) · **P1** = F3/F4/F5/F6 (this cycle).
     standalone; `database`/`secrets` still install and run against a kernel
     with no marketplace module; marketplace unit tests move with it.
 
-- [ ] F2 (DC-2, P0) — **Keep device surfaces as dumb pass-through, move
+- [x] F2 (DC-2, P0) — **Keep device surfaces as dumb pass-through, move
   interpretation:** the kernel keeps identity + liveness + raw metadata and
   exposes them as observability (same shape as `GET /plugins`); interpretation
   and friendly UX live outside (a `discovery` plugin / web frontend).
@@ -786,8 +784,9 @@ rest) · **P1** = F3/F4/F5/F6 (this cycle).
   - Acceptance: `GET /devices` stays and returns raw pass-through data; no
     interpretation helpers in the kernel; a `discovery` plugin provides the
     friendly view; device integration tests pass unchanged (no API break).
+  - **Status (2026-09-11): SHIPPED (PR #91).**
 
-- [ ] F3 (DC-2, P1) — **Keep the bridge as transport, strip capability
+- [x] F3 (DC-2, P1) — **Keep the bridge as transport, strip capability
   interpretation:** the `role: client` bridge stays in the kernel as transport
   (remote connectivity, symmetric to the WS gateway); only `device.<cap>`
   mirroring semantics move out to the remote agent.
@@ -797,8 +796,9 @@ rest) · **P1** = F3/F4/F5/F6 (this cycle).
   - Acceptance: the bridge still connects a client kernel to a host; no
     capability semantics in the kernel; the Android agent (vynkor) still pairs
     via the existing tooling; no `BridgeConfig` change needed.
+  - **Status (2026-09-11): SHIPPED (PR #92).**
 
-- [ ] F4 (DC-3, P1) — **Neutralize the AI tool-calling surface (generic
+- [x] F4 (DC-3, P1) — **Neutralize the AI tool-calling surface (generic
   manifest feature):** `action_specs`/`get_manifest` stay in the protocol as a
   generic per-action capability mechanism with the "for the AI" framing
   removed (comments/wording only — no wire break, no feature removal).
@@ -808,8 +808,9 @@ rest) · **P1** = F3/F4/F5/F6 (this cycle).
   - Acceptance: no "for the AI"/"to the AI"/"AI" references in the protocol
     schema or kernel comments for this mechanism; behavior unchanged; all
     tests green.
+  - **Status (2026-09-11): SHIPPED (this branch).**
 
-- [ ] F5 (DC-4, P1) — **Drop the hardcoded action→permission fallback
+- [x] F5 (DC-4, P1) — **Drop the hardcoded action→permission fallback
   (three-step migration):** the kernel has no knowledge of any specific
   plugin's actions; the data-driven v2 path is the single source of truth.
   Step 1 is a hard dependency: the `network` plugin declares
@@ -820,6 +821,8 @@ rest) · **P1** = F3/F4/F5/F6 (this cycle).
   - Acceptance: no plugin/action-name strings in `src/auth/`; a v2 action
     without a declared permission is **denied by default**; legacy string-form
     plugins keep working with a boot warning.
+  - **Status (2026-09-11): SHIPPED (this branch).** Temporary deprecation
+    warning kept for backward compatibility; easy to remove later.
 
 - [x] F6 (DC-5, P1) — **Manifesto wording + event-store hardening:** the "no
   databases" clause says what it means (event-delivery outbox carve-out); the
@@ -1394,27 +1397,27 @@ surfaces cover every planned plugin).
 | S2 | `data_dir` off shared /tmp + 0o700 store dir — **FIXED** (2026-08-18, PR #35) | none |
 | PERF-1 | router kernel replies off the shared-task `.send().await` — **FIXED** (2026-08-26): sync `try_send` replies, drop+counter on full channel, regression-tested | none |
 | PERF-2 | event-store SQLite off the async runtime (`spawn_blocking`) — **FIXED** (2026-08-26): async store wrappers + batched retry sweep; SdkHarness data_dir isolation kills cross-test events.db reuse | none |
-| UX-1 | JSON error envelope + honest stop status + API doc — **OPEN** (P2) | none |
-| S5 | stable wire error codes, no internals — **OPEN** (P2) | UX-1 |
+| UX-1 | JSON error envelope + honest stop status + API doc — **SHIPPED** (2026-09-11, PR #85) | none |
+| S5 | stable wire error codes, no internals — **SHIPPED** (2026-09-11, PR #87) | UX-1 |
 | UX-2 | stable `PluginInfo.state` values — **FIXED** (2026-08-24): shared lowercase `plugin_state_str`, all sites | UX-1 |
-| PERF-3 | `Arc<PluginEntry>` + action→provider index — **OPEN** (P2) | none |
-| PERF-4 | hot-path constant factors — **PARTIAL** (2026-08-26): watchdog `/proc` batched via `spawn_blocking`, ping `try_send`; WS copy closed non-issue; CRC dedup + zstd offload deferred to a wire release | vynkor-wire release (remainder) |
+| PERF-3 | `Arc<PluginEntry>` + action→provider index — **SHIPPED** (2026-09-11, PR #86) | none |
+| PERF-4 | hot-path constant factors — **SHIPPED** (2026-09-11): CRC dedup in wire 0.0.4; watchdog `/proc` + WS copy already closed | vynkor-wire 0.0.4 |
 | UX-3 | config validation consistency + surface load errors to all CLI — **FIXED** (2026-08-26): restart/log_level warn+fallback, port aligned, CLI errors propagated | none |
 | UX-4 | CLI help/output polish — **FIXED** (2026-08-24): version from cargo env, clap `about` everywhere, `plugin logs` renders line-per-entry | none |
 | S4 | dependency advisories (anyhow / number_prefix) — **FIXED** (2026-08-21): anyhow 1.0.104, h2 0.4.18, number_prefix dropped via indicatif 0.18 — cargo audit clean | none |
-| MA-01 | split `ipc/protocol.rs` + `marketplace/registry.rs` monoliths — **OPEN** (P0, 2026-08-20 audit) | MA-02 |
+| MA-01 | split `ipc/protocol.rs` + `marketplace/registry.rs` monoliths — **SHIPPED** (2026-09-11, PR #82) | MA-02 |
 | MA-02 | extract duplicated `target_bytes`/`build_frame` + `resolve_*_url` helpers — **FIXED** (2026-08-26): inline Frame builds → `ipc::framing::build_frame`, `utils/url.rs` owns `DEFAULT_WS_PATH` + ws-scheme map | none |
 | MA-03 | unify error system on `VynkorError`; `jwt::validate() -> VynkorError` — **FIXED** (2026-08-24): `VynkorError::Auth`, jwt paths unified, main.rs chain preserved (PR #64) | none |
 | MA-04 | replace deprecated `rand::thread_rng()` — **FIXED** (2026-08-21): jti nonce from OsRng | none |
-| MA-05 | `docs/COMMENT_TAGS.md` + reduce comment duplication + consistent style — **OPEN** (P1) | none |
+| MA-05 | `docs/COMMENT_TAGS.md` + reduce comment duplication + consistent style — **SHIPPED** (2026-09-11, PR #89) | none |
 | MA-06 | `create_router_full` → `RouterConfig` struct; move prune spawn out — **FIXED** (2026-08-24): `RouterConfig`/`BuiltRouter`, prune owned by `ApiServer::run` (PR #64) | none |
 | MA-07 | `Config::Default` dedup + clamp all zero-invalid numerics — **FIXED** (2026-08-24): Default delegates to `default_*` fns, all clamps covered (+ EventBus set-once store attach fix) (PR #64) | none |
 | MA-08 | `reset_for_test()` for global atomics (`MSG_SEQ` etc.) — **FIXED** (2026-08-21): `#[cfg(test)]` reset + regression test | none |
-| MA-09 | split `plugins/supervisor.rs` (933 L) — **OPEN** (P1) | none |
-| MA-10 | split `kernel/orchestrator.rs` (470 L) — **OPEN** (P1) | none |
+| MA-09 | split `plugins/supervisor.rs` (933 L) — **SHIPPED** (2026-09-11, PR #83) | none |
+| MA-10 | split `kernel/orchestrator.rs` (470 L) — **SHIPPED** (2026-09-11, PR #84) | none |
 | MA-11 | move `drain_to_log`/`proc_resource_usage` → `plugins/metrics.rs` — **FIXED** (2026-08-21): helpers moved verbatim, supervisor imports them | none |
 | MA-12 | log mutex poison instead of silently swallowing — **FIXED** (2026-08-21): shared `utils::sync::recover_poison`, all 14 sites | none |
-| MA-13 | reuse `vynkor_wire` framing in WS gateway; drop custom `parse_frame` — **OPEN** (P2) | none |
+| MA-13 | reuse `vynkor_wire` framing in WS gateway; drop custom `parse_frame` — **SHIPPED** (2026-09-11, PR #88) | none |
 | MA-14 | `utils/logging.rs` dedup + `try_init()` — **FIXED** (2026-08-21): one boxed fmt layer, `try_init()` no longer panics on re-init | none |
 | MA-15 | `vynkor-wire` dead-code clippy check — **FIXED** (2026-08-21): large_enum_variant allowed on generated payload oneof (wire PR #5) | none |
 | MA-16 | separate tests from prod code in `registry.rs` — **FIXED** (2026-08-21): tests moved verbatim to `registry_tests.rs`, wired via `#[path]`; registry.rs at 665 LOC prod | MA-01 |
@@ -1422,10 +1425,10 @@ surfaces cover every planned plugin).
 | MA-18 | `mint_device_token` length-checks `jwt_secret` — **FIXED** (2026-08-21): constant moved to `auth::jwt`, enforced at every mint site | none |
 | MA-19 | `debug_assert!` + SAFETY comment on `unsafe` in `main.rs:391` — **FIXED** (2026-08-21) | none |
 | F1 | marketplace out of the kernel → standalone `vynm` binary (DC-1) — **SHIPPED** 2026-08-22 (`vynkor-manager` + vynkor PR #43) (P0, 2026-08-16 dumb-core audit) | none |
-| F2 | device surfaces as dumb pass-through; interpretation moves to a `discovery` plugin (DC-2) — **OPEN** (P0) | none |
-| F3 | bridge stays as transport; strip `device.<cap>` capability interpretation (DC-2) — **OPEN** (P1) | F2 |
-| F4 | neutralize AI tool-calling surface → generic manifest feature (DC-3) — kernel-side comments landed (PR #64, 2026-08-24); proto wording open (vynkor-wire) | none |
-| F5 | drop hardcoded action→permission fallback (DC-4) — **OPEN** (P1) | network plugin v2 manifest (vynkor-plugins) |
+| F2 | device surfaces as dumb pass-through; interpretation moves to a `discovery` plugin (DC-2) — **SHIPPED** (2026-09-11, PR #91) | none |
+| F3 | bridge stays as transport; strip `device.<cap>` capability interpretation (DC-2) — **SHIPPED** (2026-09-11, PR #92) | F2 |
+| F4 | neutralize AI tool-calling surface → generic manifest feature (DC-3) — **SHIPPED** (2026-09-11, proto + kernel comments) | none |
+| F5 | drop hardcoded action→permission fallback (DC-4) — **SHIPPED** (2026-09-11, temp warning kept) | network plugin v2 manifest (vynkor-plugins) |
 | F6 | manifesto wording + event-store hardening (DC-5) — **SHIPPED** 2026-08-26: wording (`2f47d5f`) + S2 (PR #35) + PERF-2 (PR #70); DC-5 closed | none |
 
 **Ship gate:** R8-01..R8-05 are kernel-local and land together on `develop`;

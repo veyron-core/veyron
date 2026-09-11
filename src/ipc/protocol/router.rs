@@ -687,7 +687,7 @@ impl MessageRouter {
 
                 // R5-07 (option b): route to a plugin that declared this action in
                 // its manifest — "declared it" is the entire authorization model
-                // for actions with no entry in `required_permission_for_action`
+                // for actions with no v2 action_requirement.
                 // ambiguous declarations (>1 provider) are refused rather than
                 // arbitrarily resolved
                 //
@@ -712,6 +712,9 @@ impl MessageRouter {
                         );
                         Some(ActionStatus::ActionNotFound)
                     }
+                    // F5: v2 action_requirement is the single source of truth.
+                    // required_permission_for_action always returns None now —
+                    // kept only for its one-time deprecation warning.
                     ActionLookup::Found(provider)
                         if registry
                             .action_requirement(&provider.plugin_id, &req.action)

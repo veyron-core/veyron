@@ -1,19 +1,24 @@
 use crate::plugins::registry::PluginRegistry;
 use crate::proto::vynkor::PermissionType;
 use crate::utils::errors::VynkorError;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Maps a kernel-routed action name to the permission both its provider and
-/// its requester must have declared (T-19: checking the provider alone lets
-/// an unprivileged plugin launder the action through a permitted provider).
-/// Actions not listed here are unrestricted (R5-07: declared the action is
-/// authorization enough, no requester check). New sensitive actions must be
-/// added here — this is the deny-by-omission escape hatch closed, not
-/// opened, by adding an entry.
+/// F5: hardcoded action→permission fallback REMOVED. The data-driven v2
+/// path (`registry.action_requirement`) is the single source of truth.
+/// This function exists only to emit a one-time deprecation warning for
+/// legacy plugins that relied on the implicit http_request → network map.
+/// Easy to delete: remove this function and its single caller in router.rs.
 pub fn required_permission_for_action(action: &str) -> Option<PermissionType> {
-    match action {
-        "http_request" => Some(PermissionType::PermissionNetwork),
-        _ => None,
+    static WARNED_HTTP: AtomicBool = AtomicBool::new(false);
+    if action == "http_request" && !WARNED_HTTP.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            action = "http_request",
+            "hardcoded action→permission fallback removed (F5); \
+             the network plugin MUST declare action_requirement in its v2 manifest. \
+             see docs/PLUGIN_REGISTRY_SCHEMA.md"
+        );
     }
+    None
 }
 
 /// Normalizes a permission string (lowercase `storage` or proto
