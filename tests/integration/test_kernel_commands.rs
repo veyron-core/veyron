@@ -2086,6 +2086,7 @@ async fn session_close_from_third_party_is_rejected() {
 async fn session_idle_timeout_aborts_both_sides() {
     let mut cfg = test_config("/tmp/vynkor_integ_session_idle.sock", 19314);
     cfg.session_idle_timeout_secs = Some(1);
+    cfg.prune_interval_secs = 2;
     let (shutdown_tx, _registry, _bus) = start_kernel_with_config(cfg).await;
 
     let mut provider = VynkorClient::connect("/tmp/vynkor_integ_session_idle.sock")
@@ -2143,10 +2144,10 @@ async fn session_idle_timeout_aborts_both_sides() {
         .unwrap();
     let _ = timeout(Duration::from_secs(2), requester.recv()).await; // drain the accept
 
-    // Do nothing for longer than session_idle_timeout_secs + the 60s...
-    // Actually the prune tick interval is fixed at 60s in run_with_context,
-    // independent of session_idle_timeout_secs — wait for a tick.
-    let abort = timeout(Duration::from_secs(75), requester.recv())
+    // Do nothing for longer than session_idle_timeout_secs (1s) + one prune
+    // tick (2s, set via cfg.prune_interval_secs) — the idle sweep only runs
+    // on a prune tick, so wait for the tick to fire.
+    let abort = timeout(Duration::from_secs(10), requester.recv())
         .await
         .expect("must receive an abort within one prune tick after idling")
         .unwrap();

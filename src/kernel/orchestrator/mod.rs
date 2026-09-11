@@ -191,6 +191,7 @@ impl Kernel {
             config.max_conn_errors,
             config.max_tracked_error_conns,
             config.session_idle_timeout_secs,
+            config.prune_interval_secs,
             device_store.clone(),
             bridge_handle,
         ));

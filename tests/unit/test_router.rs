@@ -827,6 +827,7 @@ async fn poisoned_session_key_cell_still_installs_mac_key() {
         16,
         8192,
         None,
+        60,
         None, // device_store
         None,
     ));
@@ -1084,6 +1085,7 @@ fn spawn_router_with_jwt_and_config_perms(
         16,
         8192,
         None,
+        60,
         None, // device_store
         None,
     ));
@@ -1242,6 +1244,7 @@ async fn unregistered_connection_error_budget_survives_map_prune() {
         /* max_conn_errors */ 3,
         /* max_tracked_error_conns */ 1,
         None,
+        60,
         None, // device_store
         None,
     ));

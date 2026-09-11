@@ -28,8 +28,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use super::helpers::{
-    abort_stream, action_status_message, envelope_message_id, is_throttle_exempt, send_envelope,
-    send_error, send_register_reject, try_send_envelope, ACTION_CORRELATION_SEQ, EVENT_PUBLISH_SEQ,
+    abort_stream, action_status_message, envelope_message_id, is_throttle_exempt,
+    notify_forced_termination, send_envelope, send_error, send_register_reject, try_send_envelope,
+    ACTION_CORRELATION_SEQ, EVENT_PUBLISH_SEQ,
 };
 use crate::ipc::connection::out_frame;
 use crate::ipc::framing::target_as_str;
@@ -61,6 +62,7 @@ impl MessageRouter {
             defaults.max_conn_errors,
             defaults.max_tracked_error_conns,
             defaults.session_idle_timeout_secs,
+            defaults.prune_interval_secs,
             None,
             None,
         )
@@ -95,6 +97,7 @@ impl MessageRouter {
         // R6-04: idle-timeout bound for accepted streaming sessions. None =
         // disabled, matching action_caller_rate_limit_rps's unlimited convention
         session_idle_timeout_secs: Option<u32>,
+        prune_interval_secs: u64,
         // E-01: per-device credential store. When auth is on, any registration
         // declaring a device_id must present an active row here, and the
         // frame-MAC key for that connection derives from the row's secret
@@ -135,7 +138,7 @@ impl MessageRouter {
         // periodic eviction this keyed state grows for the life of the
         // process (AUDIT M-01). Evict idle keys on the same cadence as the
         // error-budget map prune
-        let mut prune_tick = tokio::time::interval(Duration::from_secs(60));
+        let mut prune_tick = tokio::time::interval(Duration::from_secs(prune_interval_secs));
         prune_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -162,12 +165,16 @@ impl MessageRouter {
                     }
                     if let Some(idle_secs) = session_idle_timeout_secs {
                         let idle_timeout = Duration::from_secs(idle_secs as u64);
-                        for (internal_id, _pending) in
+                        for (internal_id, pending) in
                             registry.sweep_idle_sessions(Instant::now(), idle_timeout)
                         {
-                            abort_stream(
+                            // sweep already removed the entry; pass it straight
+                            // through rather than re-taking (abort_stream re-takes
+                            // and would no-op on the already-removed slot)
+                            notify_forced_termination(
                                 &registry,
                                 &internal_id,
+                                pending,
                                 "idle timeout",
                             )
                             .await;
