@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 // D-03: registry now stores the wire DeviceInfo/DeviceState/DeviceOs (proto
-// v1.6) directly — re-exported so callers keep the registry:: path.
+// v1.6) directly — re-exported so callers keep the registry:: path
 pub use crate::proto::vynkor::{ActionRisk, DeviceInfo, DeviceOs, DeviceState};
 
 /// Device identity + metadata parsed off `PluginRegister` (D-03). The
@@ -35,7 +35,7 @@ pub enum ActionLookup {
     // Arc: PluginEntry lives once in the registry; routing holds a cheap
     // refcount bump instead of a deep clone (PERF-3). Pointer-sized, so no
     // clippy large-enum-variant issue — the manifest sits behind the Arc on
-    // the heap, exactly as the previous Box<PluginEntry> did.
+    // the heap, exactly as the previous Box<PluginEntry> did
     Found(Arc<PluginEntry>),
     /// Colliding plugin ids, for the caller to log.
     Ambiguous(Vec<String>),
@@ -162,13 +162,13 @@ impl PluginRegistry {
         // shard lock for the call — rather than a separate contains_key then
         // insert. The prior check-then-insert was only TOCTOU-safe because
         // the router happens to call register() from a single task; entry()
-        // makes that true regardless of caller concurrency.
+        // makes that true regardless of caller concurrency
         //
-        // One registration per connection. Without this, a connection that
+        // one registration per connection. Without this, a connection that
         // sends a second PluginRegister with a different id would overwrite
         // its by_conn_id mapping and orphan the first entry — it would leak
         // in by_plugin_id forever (disconnect only cleans the id the conn
-        // maps to).
+        // maps to)
         let conn_slot = match self.by_conn_id.entry(conn_id) {
             Entry::Occupied(_) => {
                 return Err(VynkorError::PluginAlreadyRegistered(format!(
@@ -748,7 +748,7 @@ pub fn action_risk_str(risk: i32) -> &'static str {
 
 // UX-2: single source for the public PluginState string — REST /plugins and
 // the kernel list_plugins command must agree, and a Rust Debug name
-// ("Registered") is not an API contract. Lowercase like device_state_str.
+// ("Registered") is not an API contract. Lowercase like device_state_str
 pub fn plugin_state_str(state: &PluginState) -> &'static str {
     match state {
         PluginState::Registered => "registered",

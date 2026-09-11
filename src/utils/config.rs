@@ -171,10 +171,11 @@ pub struct Config {
     /// first start; set `tls: false` to serve plain HTTP (insecure).
     #[serde(default = "default_tls")]
     pub tls: bool,
-    /// TLS certificate (PEM). When both cert and key are set, the WS/HTTP gateway binds TLS.
+    /// TLS certificate (PEM). Pair with `tls_key_path`; one without the other
+    /// is a boot error (see `resolve_tls_paths`).
     #[serde(default)]
     pub tls_cert_path: Option<PathBuf>,
-    /// TLS private key (PEM). When both cert and key are set, the WS/HTTP gateway binds TLS.
+    /// TLS private key (PEM).
     #[serde(default)]
     pub tls_key_path: Option<PathBuf>,
     /// Audience the kernel requires in every accepted JWT (D-07). Unset =
@@ -282,6 +283,7 @@ fn default_log_level() -> String {
 
 /// pid/log files got the same symlink-attack surface as the socket
 /// (AUDIT M-09) — default them out of the shared `/tmp` the same way.
+/// see ipc/server.rs for the socket-perms rationale.
 fn default_pid_path() -> PathBuf {
     vynkor_wire::socket::default_private_dir()
         .map(|dir| dir.join("vyn.pid"))
