@@ -31,8 +31,8 @@ the tag against the normalized (decompressed) header/payload, not the raw wire b
 > correctly (R5-01 ✓): payload is always plaintext after the read call, and MAC
 > verification (when a session key is supplied) runs against the rebuilt plaintext
 > header. Python depends on `zstandard`; C++ links `libzstd` via pkg-config. The
-> WebSocket gateway rejects inbound frames carrying `FLAG_COMPRESSED` with a parse
-> error (R5-03 ✓) rather than mishandle them — see below.
+> WebSocket gateway normalizes `FLAG_COMPRESSED` through the shared wire reader
+> (MA-13) — see below.
 
 ### MAC Failure Wire Behavior (R5-12)
 
@@ -72,15 +72,22 @@ See [Audio Permissions](#audio-permissions) below.
 
 ## WebSocket Gateway Inbound Frame Support (R5-03)
 
-`parse_frame` (`src/api/websocket.rs`) does not decompress or reassemble frames —
-WS has its own native message framing, so `FLAG_FRAGMENTED` support isn't needed,
-and normalizing `FLAG_COMPRESSED` before MAC verification/routing was out of scope
-for the gateway. Rather than silently mis-verify a MAC or route a still-compressed
-payload downstream, the gateway **rejects** any inbound binary frame carrying
-`FLAG_COMPRESSED` or `FLAG_FRAGMENTED` with a parse error (counted the same as any
-other malformed frame, subject to the existing `MAX_WS_PARSE_ERRORS` budget). This
-does not affect kernel→WS outbound frames, which are never compressed (the gateway
-does not call `write_frame_raw`).
+The WebSocket gateway parses inbound binary messages with the kernel's single
+frame parser (`crate::ipc::framing::parse_frame`, MA-13), which delegates to
+`vynkor_wire::framing::read_frame` — the same reader the UDS path uses.
+
+- `FLAG_COMPRESSED` is **decompressed and normalized** exactly as on the UDS
+  read path: the payload is plaintext and flags/length/crc32 describe the
+  plaintext, so MAC verification and routing operate on the same normalized
+  form. (Previously the gateway rejected compressed frames rather than
+  normalize them; MA-13 removed the duplicate parser that forced that.)
+- `FLAG_FRAGMENTED` is still **rejected** with a parse error (counted against
+  the existing `MAX_WS_PARSE_ERRORS` budget): neither the gateway nor the
+  `role: client` bridge has a fragment-reassembly layer (WebSocket already
+  frames messages), so a fragment would reach the router half-parsed.
+
+This does not affect kernel→WS outbound frames, which are never compressed (the
+gateway does not call `write_frame_raw`).
 
 ## WebSocket JWT Delivery
 
