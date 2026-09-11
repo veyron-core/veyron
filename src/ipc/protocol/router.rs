@@ -6,82 +6,33 @@ use crate::auth::permissions::{
 use crate::bridge::BridgeHandle;
 use crate::events::bus::EventBus;
 use crate::events::store::EventStore;
-use crate::ipc::connection::{out_frame, Outbound};
-use crate::ipc::framing::{build_frame, target_as_str, Frame, FLAG_RAW_BINARY};
+use crate::ipc::connection::Outbound;
+use crate::ipc::framing::{Frame, FLAG_RAW_BINARY};
 use crate::ipc::messages::IncomingMessage;
 use crate::kernel::commands::{CommandHandler, CommandOutcome};
 use crate::plugins::registry::{ActionLookup, DeviceMeta, PendingAction, PluginRegistry};
 use crate::proto::vynkor::{
     envelope, ActionRequest, ActionRequestChunk, ActionResponse, ActionResponseChunk, ActionStatus,
-    ActionStreamAbort, DeviceOs, Envelope, ErrorCode, ErrorMessage, Event, EventPublishAck,
-    EventPublishStatus, KernelCommandAck, PermissionType, PluginRegisterAck, Pong, SessionClose,
+    DeviceOs, Envelope, ErrorCode, Event, EventPublishAck, EventPublishStatus, KernelCommandAck,
+    PermissionType, PluginRegisterAck, Pong, SessionClose,
 };
 use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 use metrics::{counter, histogram};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-static MSG_SEQ: AtomicU64 = AtomicU64::new(0);
-static ACTION_CORRELATION_SEQ: AtomicU64 = AtomicU64::new(0);
-static EVENT_PUBLISH_SEQ: AtomicU64 = AtomicU64::new(0);
-
-/// ma-08: process-wide and never reset in prod — tests that depend on
-/// sequence ordering across runs call this in their setup
-#[cfg(test)]
-pub(crate) fn reset_for_test() {
-    MSG_SEQ.store(0, Ordering::Relaxed);
-    ACTION_CORRELATION_SEQ.store(0, Ordering::Relaxed);
-    EVENT_PUBLISH_SEQ.store(0, Ordering::Relaxed);
-}
-
-/// D-10: process-unique trace id for kernel-stamped envelopes. Shared by
-/// `build_outbound` and the event bus so the two stamping sites can never
-/// collide on the same `k-{ts}-{seq}` value.
-pub(crate) fn kernel_message_id() -> String {
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let seq = MSG_SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("k-{ts}-{seq}")
-}
-
-/// D-10: best-effort read of the envelope's `message_id` for the trace logs.
-/// Observability only — never gates or alters routing (zero-parse preserved);
-/// payloads that aren't envelopes (e.g. `FLAG_RAW_BINARY` audio chunks) simply
-/// log an empty id.
-fn envelope_message_id(frame: &Frame) -> String {
-    Envelope::decode(frame.payload.as_ref())
-        .map(|env| env.message_id)
-        .unwrap_or_default()
-}
-
-/// Throttled connections drop further messages without a reply to cap
-/// amplification (VULN-007). Provider replies must be exempt or a burst of
-/// preceding errors (e.g. many `tts_speak` audio chunk forwards denied by
-/// `ipc_targets`) would stall the caller: the final `ActionResponse` would
-/// be silently dropped, exactly the supervised-stall observed for sherpa
-/// TTS. `Pong` is also exempt or the watchdog would SIGKILL a throttled
-/// plugin that is otherwise healthy.
-fn is_throttle_exempt(frame: &Frame) -> bool {
-    let Ok(env) = Envelope::decode(frame.payload.as_ref()) else {
-        return false;
-    };
-    matches!(
-        env.payload,
-        Some(envelope::Payload::ActionResponse(_))
-            | Some(envelope::Payload::ActionResponseChunk(_))
-            | Some(envelope::Payload::ActionRequestChunk(_))
-            | Some(envelope::Payload::SessionClose(_))
-            | Some(envelope::Payload::Pong(_))
-    )
-}
+use super::helpers::{
+    abort_stream, envelope_message_id, is_throttle_exempt, send_envelope, send_error,
+    send_register_reject, try_send_envelope, ACTION_CORRELATION_SEQ, EVENT_PUBLISH_SEQ,
+};
+use crate::ipc::connection::out_frame;
+use crate::ipc::framing::target_as_str;
 
 pub struct MessageRouter;
 
@@ -207,17 +158,16 @@ impl MessageRouter {
                             })),
                             ..Default::default()
                         };
-                        Self::send_envelope(&expired.requester_write_tx, response);
+                        send_envelope(&expired.requester_write_tx, response);
                     }
                     if let Some(idle_secs) = session_idle_timeout_secs {
                         let idle_timeout = Duration::from_secs(idle_secs as u64);
-                        for (internal_id, pending) in
+                        for (internal_id, _pending) in
                             registry.sweep_idle_sessions(Instant::now(), idle_timeout)
                         {
-                            Self::notify_forced_termination(
+                            abort_stream(
                                 &registry,
                                 &internal_id,
-                                pending,
                                 "idle timeout",
                             )
                             .await;
@@ -236,7 +186,7 @@ impl MessageRouter {
             if let Some(limiter) = &ipc_limiter {
                 if limiter.check_key(&conn_id).is_err() {
                     counter!("ipc_send_denied_total").increment(1);
-                    Self::send_error(
+                    send_error(
                         &msg.write_tx,
                         ErrorCode::ErrRateLimited,
                         "IPC rate limit exceeded",
@@ -255,7 +205,7 @@ impl MessageRouter {
                         .map(|b| format!("{b:02x}"))
                         .collect();
                     warn!(conn_id, raw_target = %raw_hex, "frame target is not valid UTF-8");
-                    Self::send_error(
+                    send_error(
                         &msg.write_tx,
                         ErrorCode::ErrUnknown,
                         "invalid UTF-8 in frame target",
@@ -377,7 +327,7 @@ impl MessageRouter {
         let envelope = match Envelope::decode(msg.frame.payload.as_ref()) {
             Ok(e) => e,
             Err(_) => {
-                Self::send_error(
+                send_error(
                     &msg.write_tx,
                     ErrorCode::ErrDeserialization,
                     "decode failed",
@@ -389,7 +339,7 @@ impl MessageRouter {
         // Allow PluginRegister from unregistered senders; all others require registration
         let is_register = matches!(envelope.payload, Some(envelope::Payload::PluginRegister(_)));
         if !is_register && !registry.is_registered(msg.conn_id) {
-            Self::send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
+            send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
             return true;
         }
 
@@ -407,7 +357,7 @@ impl MessageRouter {
                     .unwrap_or("");
                 let plugin_major = reg.protocol_version.split('.').next().unwrap_or(wire_major);
                 if !reg.protocol_version.is_empty() && plugin_major != wire_major {
-                    Self::send_error(
+                    send_error(
                         &msg.write_tx,
                         ErrorCode::ErrProtocolMismatch,
                         &format!(
@@ -429,10 +379,7 @@ impl MessageRouter {
                             let device_match =
                                 !reg.device_id.is_empty() && claims.sub == reg.device_id;
                             if claims.sub != plugin_id && !device_match {
-                                Self::send_register_reject(
-                                    &msg.write_tx,
-                                    "token plugin_id mismatch",
-                                );
+                                send_register_reject(&msg.write_tx, "token plugin_id mismatch");
                                 return true;
                             }
                             // Token fields take precedence over manifest declaration
@@ -440,7 +387,7 @@ impl MessageRouter {
                             manifest.ipc_targets = claims.ipc_targets;
                         }
                         Err(e) => {
-                            Self::send_register_reject(&msg.write_tx, &format!("auth failed: {e}"));
+                            send_register_reject(&msg.write_tx, &format!("auth failed: {e}"));
                             return true;
                         }
                     }
@@ -457,7 +404,7 @@ impl MessageRouter {
                         match store.active_secret(&reg.device_id) {
                             Ok(Some(secret)) => device_secret = Some(secret.into_bytes()),
                             Ok(None) => {
-                                Self::send_register_reject(
+                                send_register_reject(
                                     &msg.write_tx,
                                     &format!(
                                         "unknown device '{}' — pair it via `vyn device connect`",
@@ -467,7 +414,7 @@ impl MessageRouter {
                                 return true;
                             }
                             Err(e) => {
-                                Self::send_register_reject(&msg.write_tx, &e.to_string());
+                                send_register_reject(&msg.write_tx, &e.to_string());
                                 return true;
                             }
                         }
@@ -587,7 +534,7 @@ impl MessageRouter {
                     payload: Some(envelope::Payload::PluginRegisterAck(ack)),
                     ..Default::default()
                 };
-                Self::send_envelope(&msg.write_tx, response);
+                send_envelope(&msg.write_tx, response);
 
                 // Enable the frame MAC for this connection: derive the key, store
                 // it for inbound verification, and tell the write loop (ordered
@@ -646,7 +593,7 @@ impl MessageRouter {
                     })),
                     ..Default::default()
                 };
-                Self::send_envelope(&msg.write_tx, pong);
+                send_envelope(&msg.write_tx, pong);
                 false
             }
 
@@ -720,7 +667,7 @@ impl MessageRouter {
                     })),
                     ..Default::default()
                 };
-                Self::send_envelope(&msg.write_tx, ack);
+                send_envelope(&msg.write_tx, ack);
                 false
             }
 
@@ -836,7 +783,7 @@ impl MessageRouter {
                             })),
                             ..Default::default()
                         };
-                        Self::send_envelope(&provider.write_tx, forwarded);
+                        send_envelope(&provider.write_tx, forwarded);
                         None
                     }
                 };
@@ -852,7 +799,7 @@ impl MessageRouter {
                         })),
                         ..Default::default()
                     };
-                    Self::send_envelope(&msg.write_tx, response);
+                    send_envelope(&msg.write_tx, response);
                 }
                 histogram!("action_request_duration_ms")
                     .record(action_start.elapsed().as_millis() as f64);
@@ -888,7 +835,7 @@ impl MessageRouter {
                             })),
                             ..Default::default()
                         };
-                        Self::send_envelope(&pending.requester_write_tx, response);
+                        send_envelope(&pending.requester_write_tx, response);
                     }
                     None => {
                         warn!(
@@ -932,20 +879,15 @@ impl MessageRouter {
                                     )),
                                     ..Default::default()
                                 };
-                                if !Self::try_send_envelope(&provider_entry.write_tx, forwarded) {
+                                if !try_send_envelope(&provider_entry.write_tx, forwarded) {
                                     warn!(action_id = %internal_id, "request chunk forward failed, aborting stream");
-                                    Self::abort_stream(
-                                        registry,
-                                        &internal_id,
-                                        "receiver backpressure",
-                                    )
-                                    .await;
+                                    abort_stream(registry, &internal_id, "receiver backpressure")
+                                        .await;
                                 }
                             }
                             None => {
                                 warn!(action_id = %internal_id, "request chunk provider disconnected, aborting stream");
-                                Self::abort_stream(registry, &internal_id, "provider disconnected")
-                                    .await;
+                                abort_stream(registry, &internal_id, "provider disconnected").await;
                             }
                         }
                     }
@@ -987,10 +929,9 @@ impl MessageRouter {
                             )),
                             ..Default::default()
                         };
-                        if !Self::try_send_envelope(&pending.requester_write_tx, forwarded) {
+                        if !try_send_envelope(&pending.requester_write_tx, forwarded) {
                             warn!(action_id = %chunk.action_id, "response chunk forward failed, aborting stream");
-                            Self::abort_stream(registry, &chunk.action_id, "receiver backpressure")
-                                .await;
+                            abort_stream(registry, &chunk.action_id, "receiver backpressure").await;
                         }
                     }
                     None => {
@@ -1007,11 +948,7 @@ impl MessageRouter {
                 let sender_id = match registry.get_by_conn_id(msg.conn_id) {
                     Some(entry) => entry.plugin_id,
                     None => {
-                        Self::send_error(
-                            &msg.write_tx,
-                            ErrorCode::ErrNotRegistered,
-                            "not registered",
-                        );
+                        send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
                         return true;
                     }
                 };
@@ -1040,7 +977,7 @@ impl MessageRouter {
                             sender = %sender_id,
                             "SessionClose before session acceptance, rejecting"
                         );
-                        Self::send_error(
+                        send_error(
                             &msg.write_tx,
                             ErrorCode::ErrUnknown,
                             "session not accepted, nothing to close",
@@ -1057,7 +994,7 @@ impl MessageRouter {
                                 })),
                                 ..Default::default()
                             };
-                            let _ = Self::try_send_envelope(&pending.requester_write_tx, forwarded);
+                            let _ = try_send_envelope(&pending.requester_write_tx, forwarded);
                         } else if let Some(provider_entry) = registry.get(&pending.provider_id) {
                             let forwarded = Envelope {
                                 message_id: envelope.message_id.clone(),
@@ -1067,7 +1004,7 @@ impl MessageRouter {
                                 })),
                                 ..Default::default()
                             };
-                            let _ = Self::try_send_envelope(&provider_entry.write_tx, forwarded);
+                            let _ = try_send_envelope(&provider_entry.write_tx, forwarded);
                         }
                         registry.take_pending_action(&internal_id);
                         false
@@ -1078,11 +1015,7 @@ impl MessageRouter {
                             sender = %sender_id,
                             "SessionClose with no matching accepted session, dropping"
                         );
-                        Self::send_error(
-                            &msg.write_tx,
-                            ErrorCode::ErrUnknown,
-                            "no matching session",
-                        );
+                        send_error(&msg.write_tx, ErrorCode::ErrUnknown, "no matching session");
                         true
                     }
                 }
@@ -1126,7 +1059,7 @@ impl MessageRouter {
                     })),
                     ..Default::default()
                 };
-                Self::send_envelope(&msg.write_tx, ack);
+                send_envelope(&msg.write_tx, ack);
                 false
             }
 
@@ -1138,7 +1071,7 @@ impl MessageRouter {
             }
 
             _ => {
-                Self::send_error(&msg.write_tx, ErrorCode::ErrUnknown, "unhandled message");
+                send_error(&msg.write_tx, ErrorCode::ErrUnknown, "unhandled message");
                 true
             }
         }
@@ -1154,7 +1087,7 @@ impl MessageRouter {
         let sender_id = match registry.get_by_conn_id(msg.conn_id) {
             Some(entry) => entry.plugin_id.clone(),
             None => {
-                Self::send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
+                send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
                 return true;
             }
         };
@@ -1163,7 +1096,7 @@ impl MessageRouter {
         if check_ipc_send(registry, &sender_id).is_err() {
             warn!(sender = %sender_id, target = %plugin_id, "ipc send denied");
             counter!("ipc_send_denied_total").increment(1);
-            Self::send_error(
+            send_error(
                 &msg.write_tx,
                 ErrorCode::ErrPermissionDenied,
                 "PERMISSION_IPC_SEND required",
@@ -1177,7 +1110,7 @@ impl MessageRouter {
                 None => {
                     warn!(sender = %sender_id, "sender vanished between checks");
                     counter!("ipc_send_denied_total").increment(1);
-                    Self::send_error(
+                    send_error(
                         &msg.write_tx,
                         ErrorCode::ErrPermissionDenied,
                         "sender not found",
@@ -1196,7 +1129,7 @@ impl MessageRouter {
                         "cross-user IPC denied (mux)"
                     );
                     counter!("ipc_send_denied_total").increment(1);
-                    Self::send_error(
+                    send_error(
                         &msg.write_tx,
                         ErrorCode::ErrPermissionDenied,
                         "cross-user IPC denied",
@@ -1219,7 +1152,7 @@ impl MessageRouter {
             if !allowed {
                 warn!(sender = %sender_id, target = %plugin_id, "ipc target not in allowlist");
                 counter!("ipc_send_denied_total").increment(1);
-                Self::send_error(
+                send_error(
                     &msg.write_tx,
                     ErrorCode::ErrPermissionDenied,
                     "target not in ipc_targets allowlist",
@@ -1235,7 +1168,7 @@ impl MessageRouter {
         {
             warn!(sender = %sender_id, target = %plugin_id, "audio stream permission denied");
             counter!("ipc_send_denied_total").increment(1);
-            Self::send_error(
+            send_error(
                 &msg.write_tx,
                 ErrorCode::ErrPermissionDenied,
                 "PERMISSION_AUDIO_STREAM required for FLAG_RAW_BINARY frames",
@@ -1308,7 +1241,7 @@ impl MessageRouter {
                     }
                 }
                 warn!(target = %plugin_id, "forward: unknown target");
-                Self::send_error(&msg.write_tx, ErrorCode::ErrUnknown, "plugin not found");
+                send_error(&msg.write_tx, ErrorCode::ErrUnknown, "plugin not found");
                 true
             }
         }
@@ -1318,7 +1251,7 @@ impl MessageRouter {
         let sender_id = match registry.get_by_conn_id(msg.conn_id) {
             Some(entry) => entry.plugin_id.clone(),
             None => {
-                Self::send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
+                send_error(&msg.write_tx, ErrorCode::ErrNotRegistered, "not registered");
                 return true;
             }
         };
@@ -1327,7 +1260,7 @@ impl MessageRouter {
         if check_ipc_send(registry, &sender_id).is_err() {
             warn!(sender = %sender_id, "broadcast denied");
             counter!("ipc_send_denied_total").increment(1);
-            Self::send_error(
+            send_error(
                 &msg.write_tx,
                 ErrorCode::ErrPermissionDenied,
                 "PERMISSION_IPC_SEND required",
@@ -1342,7 +1275,7 @@ impl MessageRouter {
         {
             warn!(sender = %sender_id, "audio stream broadcast denied");
             counter!("ipc_send_denied_total").increment(1);
-            Self::send_error(
+            send_error(
                 &msg.write_tx,
                 ErrorCode::ErrPermissionDenied,
                 "PERMISSION_AUDIO_STREAM required for FLAG_RAW_BINARY frames",
@@ -1388,193 +1321,5 @@ impl MessageRouter {
             }
         }
         false
-    }
-
-    fn send_register_reject(tx: &mpsc::Sender<Outbound>, reason: &str) {
-        let ack = PluginRegisterAck {
-            accepted: false,
-            reject_reason: reason.to_string(),
-            granted_permissions: vec![],
-            session_nonce: Vec::new(),
-        };
-        let env = Envelope {
-            payload: Some(envelope::Payload::PluginRegisterAck(ack)),
-            ..Default::default()
-        };
-        Self::send_envelope(tx, env);
-    }
-
-    /// Builds the outbound wire frame for `env`, or `None` if encoding
-    /// failed — mirrors the original `send_envelope`'s silent early-return
-    /// on an encode error (unchanged behavior, just factored out so both
-    /// send paths share it).
-    fn build_outbound(mut env: Envelope) -> Option<Outbound> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        // D-10: a caller that already set `message_id` (a trace id preserved
-        // from an inbound envelope) keeps it; only stamp a fresh id when
-        // there isn't one — otherwise the kernel hop breaks the trace.
-        if env.message_id.is_empty() {
-            env.message_id = kernel_message_id();
-        }
-        env.timestamp = ts;
-        env.sender_id = "kernel".to_string();
-        debug!(
-            message_id = %env.message_id,
-            sender_id = %env.sender_id,
-            target = "client",
-            hop = 1,
-            "kernel message dispatched"
-        );
-
-        let mut payload = Vec::new();
-        if env.encode(&mut payload).is_err() {
-            return None;
-        }
-        Some(out_frame(build_frame("client", 0, payload)))
-    }
-
-    /// Kernel→connection envelope send. Non-blocking (PERF-1/T-03): the
-    /// router task is shared by every connection, so awaiting one peer's
-    /// full write channel stalls all IPC. A full channel drops the reply
-    /// (counted); a closed channel means the connection is already gone.
-    /// Stream forwards that must react to a drop use [`Self::try_send_envelope`].
-    fn send_envelope(tx: &mpsc::Sender<Outbound>, env: Envelope) {
-        if let Some(out) = Self::build_outbound(env) {
-            match tx.try_send(out) {
-                Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
-                    warn!("kernel reply dropped: peer write channel full");
-                    counter!("kernel_replies_dropped_total").increment(1);
-                }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
-                    debug!("kernel reply dropped: peer write channel closed");
-                }
-            }
-        }
-    }
-
-    /// Non-blocking counterpart of `send_envelope` that reports whether the
-    /// frame was enqueued, for forwarding to a *different* connection's
-    /// channel (R6-02 stream chunks); callers are responsible for reacting
-    /// to a drop (R6-02: abort the whole stream — see `abort_stream`).
-    pub(crate) fn try_send_envelope(tx: &mpsc::Sender<Outbound>, env: Envelope) -> bool {
-        match Self::build_outbound(env) {
-            Some(out) => tx.try_send(out).is_ok(),
-            None => false,
-        }
-    }
-
-    fn send_error(tx: &mpsc::Sender<Outbound>, code: ErrorCode, message: &str) {
-        let env = Envelope {
-            payload: Some(envelope::Payload::Error(ErrorMessage {
-                code: code as i32,
-                message: message.to_string(),
-                details: String::new(),
-            })),
-            ..Default::default()
-        };
-        Self::send_envelope(tx, env);
-    }
-
-    /// R6-02/R6-04: abort an in-flight stream — remove its pending-action
-    /// slot and notify both sides. Called whenever `try_send_envelope` fails
-    /// while forwarding a stream chunk in either direction, so a full/closed
-    /// channel never means a silently dropped (and therefore corrupting)
-    /// chunk — the whole stream dies instead, loudly, on both ends.
-    async fn abort_stream(registry: &PluginRegistry, internal_id: &str, reason: &str) {
-        let Some(pending) = registry.take_pending_action(internal_id) else {
-            return;
-        };
-        Self::notify_forced_termination(registry, internal_id, pending, reason).await;
-    }
-
-    /// Shared by `abort_stream` (backpressure/disconnect, R6-02) and the
-    /// idle-timeout sweep (R6-04). Sends `ActionStreamAbort` to both sides.
-    ///
-    /// R6-04: `pending.session_accepted` decides whether the requester also
-    /// gets a terminal `ActionResponse{ACTION_STREAM_BACKPRESSURE}`. Before
-    /// acceptance the requester is still awaiting its *first* (and only
-    /// expected) `ActionResponse`, so one must be synthesized here — this is
-    /// unchanged R6-02 behavior. Once a session is accepted, the requester
-    /// already received the real accepting `ActionResponse{OK}`; sending a
-    /// second `ActionResponse` for the same `action_id` would be a
-    /// surprising duplicate the requester never expects, so only
-    /// `ActionStreamAbort` is sent. The idle-timeout sweep only ever finds
-    /// accepted sessions (see `sweep_idle_sessions`), so this branch is
-    /// always taken for that caller — no special-casing needed there.
-    ///
-    /// Both notification sends are non-blocking (`try_send_envelope`): this
-    /// is invoked from the shared router loop, which must never block on
-    /// any single connection's channel (see the non-blocking-in-shared-loop
-    /// invariant at `forward()`). Best-effort delivery is acceptable: there
-    /// is no further fallback if even the abort notice can't be sent.
-    async fn notify_forced_termination(
-        registry: &PluginRegistry,
-        internal_id: &str,
-        pending: PendingAction,
-        reason: &str,
-    ) {
-        counter!("action_stream_aborted_total", "reason" => reason.to_string()).increment(1);
-
-        let abort_to_requester = Envelope {
-            payload: Some(envelope::Payload::ActionStreamAbort(ActionStreamAbort {
-                action_id: pending.original_action_id.clone(),
-                reason: reason.to_string(),
-            })),
-            ..Default::default()
-        };
-        let _ = Self::try_send_envelope(&pending.requester_write_tx, abort_to_requester);
-
-        if !pending.session_accepted {
-            let terminal_response = Envelope {
-                payload: Some(envelope::Payload::ActionResponse(ActionResponse {
-                    action_id: pending.original_action_id,
-                    status: ActionStatus::ActionStreamBackpressure as i32,
-                    data_json: vec![],
-                    error: reason.to_string(),
-                })),
-                ..Default::default()
-            };
-            let _ = Self::try_send_envelope(&pending.requester_write_tx, terminal_response);
-        }
-
-        if let Some(provider_entry) = registry.get(&pending.provider_id) {
-            let abort_to_provider = Envelope {
-                payload: Some(envelope::Payload::ActionStreamAbort(ActionStreamAbort {
-                    action_id: internal_id.to_string(),
-                    reason: reason.to_string(),
-                })),
-                ..Default::default()
-            };
-            // Best-effort — if the provider's channel is also the one that's
-            // full, it'll simply never see this notice and will discover the
-            // stream is dead the next time it tries to send a chunk.
-            let _ = Self::try_send_envelope(&provider_entry.write_tx, abort_to_provider);
-        }
-    }
-}
-
-#[cfg(test)]
-mod seq_reset_tests {
-    use super::*;
-
-    #[test]
-    fn reset_for_test_zeroes_all_sequence_atomics() {
-        // drive all three past zero first
-        let _ = kernel_message_id();
-        let _ = ACTION_CORRELATION_SEQ.fetch_add(1, Ordering::Relaxed);
-        let _ = EVENT_PUBLISH_SEQ.fetch_add(1, Ordering::Relaxed);
-        assert_ne!(MSG_SEQ.load(Ordering::Relaxed), 0);
-
-        reset_for_test();
-
-        // tight window: a concurrent lib-test bump between store and load is
-        // theoretically possible but the counters only move per envelope
-        assert_eq!(MSG_SEQ.load(Ordering::Relaxed), 0);
-        assert_eq!(ACTION_CORRELATION_SEQ.load(Ordering::Relaxed), 0);
-        assert_eq!(EVENT_PUBLISH_SEQ.load(Ordering::Relaxed), 0);
     }
 }
